@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Duet · Codex × Claude"
+  short_description: "Pair original Codex and Claude conversations on one project"
+  default_prompt: "Use $agent-duet to pair this original conversation with the other original Codex/Claude Code conversation on this exact project. Verify native wakeups both ways, preserve each context, and hand off work until independently verified completion."
