@@ -1,3 +1,4 @@
+import isolate  # noqa: F401  (must come first)
 import importlib.util
 from pathlib import Path
 import sys

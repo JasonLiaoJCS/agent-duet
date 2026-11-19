@@ -1,4 +1,5 @@
 """Checks that matter when someone installs Agent Duet on a different computer."""
+import isolate  # noqa: F401  (must come first)
 import importlib.util
 import json
 import os

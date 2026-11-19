@@ -1,0 +1,22 @@
+name: tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.10", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Unit tests (no model calls, no CLIs required)
+        run: python -X utf8 -m unittest discover -s tests -v
+      - name: Bridge starts and health check runs without either CLI
+        run: python -X utf8 agent-duet/scripts/duet.py call doctor --pretty

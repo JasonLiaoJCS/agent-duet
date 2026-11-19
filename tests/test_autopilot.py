@@ -1,3 +1,4 @@
+import isolate  # noqa: F401  (must come first)
 import json
 import os
 from pathlib import Path

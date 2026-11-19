@@ -75,6 +75,9 @@ def main():
     parser.add_argument("--default-mode", choices=["review", "work"],
                         help="Permissions for consultant CLI workers when a call omits mode: review=read-only (safe default), "
                              "work=full CLI permissions (--dangerously-* flags). Omitted keeps the previous choice, else review.")
+    parser.add_argument("--auto-update", choices=["on", "off"],
+                        help="Let Agent Duet update an outdated codex/claude CLI by itself so consultations never run on an "
+                             "old model. Omitted keeps the previous choice (off on a fresh install).")
     args = parser.parse_args()
     if sys.version_info < (3, 10):
         raise SystemExit("Agent Duet needs Python 3.10+ (3.11+ recommended).")
@@ -141,6 +144,11 @@ def main():
         result["claude_desktop"] = "registered; restart/reload Desktop to load tools"
     else:
         result["claude_desktop"] = "not configured (directory absent or skipped)"
+    if args.auto_update:
+        import duet
+        duet.change_models_state(lambda state: state.update(auto_update=args.auto_update == "on"))
+    import duet as _duet
+    result["auto_update_cli"] = _duet.auto_update_enabled()
     missing = [name for name, found in (("codex", codex), ("claude", claude)) if not found]
     result["next"] = ("Reload Codex and Claude once. Then paste the same one-line pairing request into one conversation on each side."
                       if not missing else

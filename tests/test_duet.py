@@ -1,3 +1,4 @@
+import isolate  # noqa: F401  (must come first)
 import concurrent.futures
 import importlib.util
 import json
