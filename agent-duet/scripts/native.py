@@ -331,6 +331,8 @@ def operate(d, op, a, root, state, db, project):
             create_run(db,names,now)
         run=db.execute('SELECT * FROM native_run').fetchone()
     since=now-run['window']
+    # A transport call that was interrupted (crash, kill) must not hold its place forever.
+    db.execute("UPDATE native_attempts SET state='unknown' WHERE state='sending' AND updated<?",(now-900,))
     # A transport call still in flight keeps its place in the window however long it runs.
     count,oldest=db.execute("SELECT COUNT(*),MIN(updated) FROM native_attempts WHERE run_id=? AND (updated>=? OR state='sending')",(run['id'],since)).fetchone()
     if count>=run['max_wakes']:

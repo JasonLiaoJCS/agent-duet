@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 
-VERSION = "2.8.0"
+VERSION = "2.9.0"
 TERMINAL = {"completed", "failed", "cancelled", "timed_out", "interrupted"}
 FLAGS = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
@@ -197,21 +197,34 @@ def stable_session(session):
 
 def keep_out_of_git(root):
     """The mailbox can hold project content and must not end up in a commit. Add it to this clone's
-    private exclude list (.git/info/exclude), which changes no tracked file and nobody else's setup."""
+    private exclude list, which changes no tracked file and nobody else's setup."""
     try:
-        info = root / ".git" / "info"
-        if not (root / ".git").is_dir():
+        if not (root / ".git").exists():
             return "not a git repository"
-        info.mkdir(exist_ok=True)
-        exclude = info / "exclude"
+        exclude = root / ".git" / "info" / "exclude"
+        git = shutil.which("git")
+        if git:
+            # Ask git where the file is: in a worktree .git is a file, not a directory.
+            found = subprocess.run([git, "-C", str(root), "rev-parse", "--git-path", "info/exclude"], capture_output=True, text=True,
+                                   encoding="utf-8", errors="replace", timeout=10, creationflags=FLAGS)
+            if found.returncode == 0 and found.stdout.strip():
+                exclude = Path(found.stdout.strip())
+                exclude = exclude if exclude.is_absolute() else root / exclude
+            tracked = subprocess.run([git, "-C", str(root), "ls-files", "--error-unmatch", ".agent-duet"], capture_output=True,
+                                     timeout=10, creationflags=FLAGS)
+            if tracked.returncode == 0:
+                return "WARNING: .agent-duet is already tracked by git; remove it from the index (git rm -r --cached .agent-duet)"
+        elif not (root / ".git").is_dir():
+            return "could not locate the exclude file (git is not on PATH)"
+        exclude.parent.mkdir(parents=True, exist_ok=True)
         text = exclude.read_text(encoding="utf-8", errors="replace") if exclude.exists() else ""
         if any(line.strip() in (".agent-duet/", ".agent-duet", "/.agent-duet/", "/.agent-duet") for line in text.splitlines()):
             return "already excluded"
         with open(exclude, "a", encoding="utf-8", newline="\n") as handle:
             handle.write(("" if not text or text.endswith("\n") else "\n") + ".agent-duet/\n")
-        return "added to .git/info/exclude"
-    except OSError as exc:
-        return "could not update .git/info/exclude: %s" % exc
+        return "added to the local git exclude list"
+    except (OSError, subprocess.SubprocessError) as exc:
+        return "could not update the git exclude list: %s" % exc
 
 def own_names(db, name):
     """Every participant name of the same real conversation. A conversation that came back under a
@@ -229,11 +242,12 @@ def conversation(db, name):
     session = stable_session(row["session"]) if row else None
     return (row["provider"], session) if session else ("name", name)
 
-def peer(db, name):
+def peer(db, name, touch=True):
     identifier(name)
     if not db.execute("SELECT 1 FROM peers WHERE name=?", (name,)).fetchone():
         raise ValueError("Unknown participant; call join first")
-    db.execute("UPDATE peers SET seen=? WHERE name=?", (time.time(), name))
+    if touch:  # "seen" means the conversation itself did something; a background peek does not count
+        db.execute("UPDATE peers SET seen=? WHERE name=?", (time.time(), name))
 
 SETTINGS_FILE = Path(__file__).resolve().parents[1] / "settings.json"
 NPM_PACKAGES = {"codex": "@openai/codex", "claude": "@anthropic-ai/claude-code"}
@@ -499,9 +513,10 @@ UNAVAILABLE_FOR = 24 * 3600
 NOT_FOR_THIS_ACCOUNT = re.compile(
     r"(?:model|plan|subscription|tier|access|entitle\w*|organization|account)[^\n]{0,140}?"
     r"(?:not (?:available|supported|found|allowed|included|enabled|permitted)|unavailable|no access|not have access|"
-    r"n't have access|upgrade|does not exist|doesn't exist|not exist)"
+    r"n't have access|does not include|doesn't include|upgrade|does not exist|doesn't exist|not exist)"
     r"|(?:invalid|unknown|unsupported|unrecognized) model|model_not_found|not_found_error"
-    r"|usage limit|rate limit|quota|limit (?:reached|exceeded)|too many requests|\b429\b", re.I)
+    r"|(?:you(?:'ve| have)? (?:hit|reached|exceeded)|your|account|plan)[^\n]{0,60}?(?:usage limit|rate limit|quota)"
+    r"|usage limit (?:reached|exceeded)|insufficient_quota|rate_limit_exceeded|too many requests|\b429\b", re.I)
 
 def not_for_this_account(text):
     """Does this failure mean "this account cannot use that model right now" (plan, access or quota)?
@@ -789,12 +804,29 @@ def prompt_login(provider, minutes=30):
     if not claimed:
         return {"prompted": False, "note": "The sign-in window was already opened in the last %d minutes." % minutes}
     name = "Claude" if provider == "claude" else "Codex"
-    notified = notify_user("Agent Duet: %s needs a sign-in" % name,
-                           "The %s CLI is signed out, so the two AIs cannot reach each other. A sign-in window is open: finish it in your browser." % name)
+    command = "claude auth login" if provider == "claude" else "codex login"
     window = open_login(provider)
-    return {"prompted": True, "notification_shown": notified, "sign_in_window_opened": window.get("opened", False),
-            "tell_the_user": "The %s CLI is signed out. A sign-in window was opened and a desktop notification sent; "
-                             "they only need to finish the sign-in in the browser. Then repeat this step." % name}
+    opened = bool(window.get("opened"))
+    notified = notify_user("Agent Duet: %s needs a sign-in" % name,
+                           ("The %s CLI is signed out, so the two AIs cannot reach each other. A sign-in window is open: finish it in your browser." % name)
+                           if opened else ("The %s CLI is signed out. Run `%s` in a terminal to sign in." % (name, command)))
+    if not opened and not notified:
+        # No desktop to show anything on (SSH, a headless machine). Do not pretend, and do not start the cooldown.
+        def release(state):
+            if isinstance(state.get("login_prompted"), dict):
+                state["login_prompted"].pop(provider, None)
+        try:
+            change_models_state(release)
+        except OSError:
+            pass
+        return {"prompted": False, "run_this": command,
+                "tell_the_user": "The %s CLI is signed out and no window or notification could be shown on this machine. "
+                                 "Ask the user to run `%s` in a terminal and finish the sign-in." % (name, command)}
+    return {"prompted": True, "notification_shown": notified, "sign_in_window_opened": opened, "run_this": command,
+            "tell_the_user": ("The %s CLI is signed out. A sign-in window was opened%s; they only need to finish the sign-in in the browser. Then repeat this step."
+                              % (name, " and a desktop notification sent" if notified else ""))
+                             if opened else
+                             ("The %s CLI is signed out. A desktop notification was sent; ask the user to run `%s` and finish the sign-in." % (name, command))}
 
 def login_problem(provider):
     """A sentence for the user when this CLI is definitely signed out, else None."""
@@ -1120,6 +1152,7 @@ class worker_slot:
         folder = user_dir() / "slots"
         folder.mkdir(parents=True, exist_ok=True)
         while True:
+            reclaimed = False
             for number in range(max_workers()):
                 path = folder / ("slot-%d" % number)
                 try:
@@ -1133,10 +1166,20 @@ class worker_slot:
                         pid, _, birth = path.read_text().partition(" ")
                         if alive_identity(int(pid), birth) is False:
                             path.unlink()
-                    except (OSError, ValueError):
+                            reclaimed = True
+                    except ValueError:
+                        try:  # created but never filled in (its owner died in between): reclaim after a minute
+                            if time.time() - path.stat().st_mtime > 60:
+                                path.unlink()
+                                reclaimed = True
+                        except OSError:
+                            pass
+                    except OSError:
                         pass
                 except OSError:
                     return self  # never block work on bookkeeping
+            if reclaimed:
+                continue  # a freed slot is taken at once, not after a wait
             self.give_up()  # raises on cancel or timeout
             time.sleep(2)
     def __exit__(self, *exc):
@@ -1198,6 +1241,10 @@ def run_worker(root, job_id):
         with worker_slot(slot_wait):
             while True:
                 args = list(cli(job["provider"]))  # a fresh list for every attempt
+                try:
+                    (folder / "answer.txt").unlink()  # an earlier attempt's answer must never be reported as this one's
+                except OSError:
+                    pass
                 if job["provider"] == "claude":
                     args += ["-p", "--output-format", "json", "--model", routing["model"],
                              "--effort", job["effort"], "--no-session-persistence"]
@@ -1285,7 +1332,10 @@ def run_worker(root, job_id):
                     success = False
                 # The account may not include the model that was asked for (plan, access or quota).
                 # Use the next best one it can use, once per step down, and say so in the result.
-                refused = "" if success else " ".join(str(v) for v in (result.get("error"), result.get("answer"), result.get("stderr_tail")) if v)
+                # Only the provider's own error counts, and only when the attempt produced nothing:
+                # a task that merely talks about rate limits, or work that already ran, is never redone.
+                produced = bool(result.get("answer")) if job["provider"] == "codex" else bool(((result.get("usage") or {}).get("output_tokens") or 0))
+                refused = "" if (success or produced) else (encode(result["error"]) if isinstance(result.get("error"), (dict, list)) else str(result.get("error") or ""))
                 step_down = next_route(job["provider"], routing, job["tier"], job["effort"], refused, check_cancel, started + job["timeout"]) \
                     if (refused and not_for_this_account(refused) and len(routing.get("tried") or []) < 2) else None
                 if not step_down:
@@ -1357,7 +1407,7 @@ def doctor():
 
 def doctor_fix():
     """Check, repair what can be repaired without the user, and name what only the user can do."""
-    fixed, needs_user = [], []
+    fixed, needs_user, unknown = [], [], []
     models = None
     try:
         # Resolves both tiers; with the standing permission this also updates an outdated CLI.
@@ -1371,15 +1421,19 @@ def doctor_fix():
     for provider, info in report["providers"].items():
         if info.get("logged_in") is False:
             helped = prompt_login(provider)
-            needs_user.append("Sign the %s CLI in%s: finish the sign-in in the browser." % (
-                provider, " (a sign-in window was opened and a notification sent)" if helped.get("prompted") else " with `%s`" % ("claude auth login" if provider == "claude" else "codex login")))
+            needs_user.append("Sign the %s CLI in%s." % (
+                provider, " (a sign-in window was opened): finish the sign-in in the browser" if helped.get("sign_in_window_opened")
+                else " with `%s`" % ("claude auth login" if provider == "claude" else "codex login")))
         elif "error" in info:
             needs_user.append("Install the %s CLI and sign in: %s" % (provider, info["error"]))
+        elif info.get("logged_in") is None:
+            unknown.append("Could not tell whether the %s CLI is signed in; `%s` shows it." % (
+                provider, "claude auth status" if provider == "claude" else "codex login status"))
     remaining = [a for a in (models or {}).get("actions", [])]
-    report.update(fixed=fixed, needs_user=needs_user, still_to_do_by_agent=remaining,
+    report.update(fixed=fixed, needs_user=needs_user, could_not_check=unknown, still_to_do_by_agent=remaining,
                   models={"standard": {"codex": (models or {}).get("codex", {}).get("standard"), "claude": (models or {}).get("claude", {}).get("standard")},
                           "hard": {"codex": (models or {}).get("codex", {}).get("hard"), "claude": (models or {}).get("claude", {}).get("hard")}},
-                  all_good=not needs_user and not remaining and not [p for p in report["problems"] if "signed out" not in p])
+                  all_good=not needs_user and not unknown and not remaining and not [p for p in report["problems"] if "signed out" not in p])
     return report
 
 def finish(a):
@@ -1395,12 +1449,9 @@ def finish(a):
             raise ValueError("Project ID mismatch; join this exact root first")
         peer(db, a["name"])
         now = time.time()
-        plan = shifts.load(db)
-        timer = None
-        if plan and plan.get("state") == "active":
-            timer = (plan.get("pid"), plan.get("birth"))
-            plan.update(state="stopped", ended=now)
-            shifts.save(db, plan)
+        shifts.table(db)
+        plan, timer = shifts.stop(db, now)
+        if plan:
             stopped.append("check-in schedule (after %d checks)" % plan.get("checks_done", 0))
         if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='native_run'").fetchone():
             run = db.execute("SELECT * FROM native_run").fetchone()
@@ -1408,9 +1459,21 @@ def finish(a):
             if run and run["state"] in ("active", "limit_reached") or (run and not park and run["state"] in ("paused", "needs_user")):
                 db.execute("UPDATE native_run SET state=?", (target,))
                 stopped.append("wakeups between the two conversations (%s)" % target)
-        for row in db.execute("SELECT id,provider FROM jobs WHERE status NOT IN ('completed','failed','cancelled','timed_out','interrupted')").fetchall():
+        cancelling = []
+        for row in db.execute("SELECT * FROM jobs WHERE status NOT IN ('completed','failed','cancelled','timed_out','interrupted')").fetchall():
+            row = reconcile(db, row)
+            if row["status"] in TERMINAL:
+                continue
+            if row["status"] == "orphaned":
+                # Its worker is gone but its CLI may live on: stop that process itself.
+                if stop_orphan(row):
+                    job_update(db, row["id"], "cancelled", {"message": "Stopped by finish"})
+                    stopped.append("orphaned %s consultation %s" % (row["provider"], row["id"][:8]))
+                else:
+                    still.append("%s consultation %s could not be confirmed stopped; check for a leftover CLI process" % (row["provider"], row["id"][:8]))
+                continue
             db.execute("UPDATE jobs SET cancel=1 WHERE id=?", (row["id"],))
-            stopped.append("running %s consultation %s" % (row["provider"], row["id"][:8]))
+            cancelling.append((row["id"], row["provider"]))
         released = db.execute("DELETE FROM claims").rowcount
         if released:
             stopped.append("%d file claim(s)" % released)
@@ -1424,6 +1487,20 @@ def finish(a):
         db.commit()
     finally:
         db.close()
+    if cancelling:
+        # A worker notices the cancel flag within a second and ends its CLI. Report what really ended.
+        end = time.monotonic() + 8
+        pending = dict(cancelling)
+        while pending and time.monotonic() < end:
+            time.sleep(0.5)
+            for job_id in list(pending):
+                try:
+                    if dispatch("job", {"root": a["root"], "project_id": a["project_id"], "job_id": job_id})["status"] in TERMINAL:
+                        stopped.append("%s consultation %s" % (pending.pop(job_id), job_id[:8]))
+                except Exception:
+                    break
+        for job_id, provider in pending.items():
+            still.append("%s consultation %s was told to stop and is still ending" % (provider, job_id[:8]))
     for run_id in supervisors:
         try:
             import autopilot
@@ -1447,6 +1524,7 @@ def finish(a):
     return {"finished": not park, "parked": park, "stopped": stopped or ["nothing was running"], "still_running": still,
             "kept": "Mailbox, checkpoints and history stay in .agent-duet/. Nothing of this project runs or spends in the background now."
                     if not still else "See still_running.",
+            "note": "A turn that is already running in either original conversation finishes on its own; finish cannot interrupt it.",
             "tell_the_peer": ("Leave the other conversation one final mailbox note (no wake) so it also stops: " + ", ".join(other[:3])) if other else None,
             "to_resume": "Nothing has to be paired again: duet_native_start allows wakeups again, and setting a schedule does that by itself."}
 
@@ -1502,12 +1580,6 @@ def dispatch(operation, args):
 
 def operate(op, a, root, state, db):
     now = time.time()
-    if op in ("inbox", "send", "status", "checkpoint"):
-        try:
-            import schedule
-            schedule.ensure_running(root, db)  # a timer lost to a reboot or crash comes back by itself
-        except Exception:
-            pass
     project = db.execute("SELECT * FROM project WHERE singleton=1").fetchone()
     canonical = os.path.normcase(str(root))
     if project and project["root"] != canonical:
@@ -1515,6 +1587,12 @@ def operate(op, a, root, state, db):
     if op not in ("join", "status"):
         if not project or a.get("project_id") != project["id"]:
             raise ValueError("Project ID mismatch: join the intended project before sending or executing")
+    if op in ("inbox", "send", "status", "checkpoint") and a.get("peek") is not True:
+        try:
+            import schedule
+            schedule.ensure_running(root, db)  # a timer lost to a reboot or crash comes back by itself
+        except Exception:
+            pass
     if op.startswith('native_'):
         import native
         return native.operate(sys.modules[__name__], op, a, root, state, db, project)
@@ -1648,7 +1726,7 @@ def operate(op, a, root, state, db):
                 (now, now, reply, *names)).rowcount)
         return result
     if op == "inbox":
-        peer(db, a["name"])
+        peer(db, a["name"], touch=a.get("peek") is not True)
         limit = max(1, min(100, int(a.get("limit", 20))))
         names = own_names(db, a["name"])
         marks = ",".join("?" * len(names))
@@ -1701,8 +1779,8 @@ def operate(op, a, root, state, db):
         signed_out = login_problem(provider)
         if signed_out:
             helped = prompt_login(provider)
-            raise ValueError(signed_out + (" A sign-in window was opened for the user and they were notified." if helped.get("prompted") else "")
-                             + " Tell the user, then start this consultation again once they have signed in.")
+            raise ValueError(signed_out + " " + (helped.get("tell_the_user") or "")
+                             + " Start this consultation again once they have signed in.")
         reason = a.get("reason", "")
         if (tier == "hard" or effort in ("xhigh", "max")) and not reason.strip():
             raise ValueError("Escalation needs a concrete reason")
@@ -1794,7 +1872,7 @@ DEFS = {
     "autopilot_stop": ("Stop this autonomous run and cancel its current worker; keep its handoff history.",{"root":ROOT,"run_id":S},["root","run_id"]),
     "autopilot_resume": ("Resume an interrupted or unfinished autonomous run after addressing its blocker. Never resumes completed work.",{"root":ROOT,"run_id":S,"additional_turns":I,"max_hours":{"type":"number"},"instructions":S},["root","run_id"]),
     "watch": ("Bind this MCP connection to your project mailbox for Claude Code channel notifications. Requires session channel opt-in; delivery is NOT proven until you reply/ack.",{"root":ROOT,"name":S},["root","name"]),
-    "schedule": ("Set the check-in schedule for a long task: the bridge leaves a check-in in the mailbox and wakes the conversation whose turn it is, so neither side needs a scheduler of its own. It is only the longest the task goes unwatched; either side may still wake the other at any time. mode=fixed with preset alternate (1 h each, taking turns) | codex-heavy (Claude once, Codex twice per 3 h) | claude-heavy | quick (30 min) | relaxed (2 h) | overnight (3 h), optionally interval_minutes to change the step length; mode=custom with pattern like 'claude:60,codex:60,codex:90'; mode=adaptive to decide the next check after every check (duet_schedule_next); mode=off to stop. hours (default 24, max 168) is how long it runs; note says what to watch.", {"root": ROOT, "name": S, "mode": {"enum": ["fixed", "custom", "adaptive", "off"]}, "preset": {"enum": ["alternate", "codex-heavy", "claude-heavy", "quick", "relaxed", "overnight"]}, "pattern": S, "interval_minutes": {"type": "number"}, "first_who": {"enum": ["claude", "codex"]}, "first_minutes": {"type": "number"}, "hours": {"type": "number"}, "max_checks": I, "note": S}, ["root", "name"]),
+    "schedule": ("Set the check-in schedule for a long task: the bridge leaves a check-in in the mailbox and wakes the conversation whose turn it is, so neither side needs a scheduler of its own. It is only the longest the task goes unwatched; either side may still wake the other at any time. mode=fixed with preset alternate (1 h each, taking turns) | codex-heavy (Claude once, Codex twice per 3 h) | claude-heavy | quick (30 min) | relaxed (2 h) | overnight (3 h), optionally interval_minutes to change the step length; mode=custom with pattern like 'claude:60,codex:60,codex:90'; mode=adaptive to decide the next check after every check (duet_schedule_next), optionally with around_minutes as the user's rough scale (a hint about how much to spend; strict=true makes it a limit of half to double); mode=off to stop. Never set a schedule the user did not ask for: pairing alone starts nothing in the background. hours (default 24, max 168) is how long it runs; note says what to watch. watch='runs/log.txt,results/*.json' makes a check-in wake a side only when one of those project files changed since the last check (or after max_quiet_minutes of silence), which saves a whole turn every time a long run is simply still running.", {"root": ROOT, "name": S, "watch": S, "max_quiet_minutes": {"type": "number"}, "around_minutes": {"type": "number"}, "strict": {"type": "boolean"}, "mode": {"enum": ["fixed", "custom", "adaptive", "off"]}, "preset": {"enum": ["alternate", "codex-heavy", "claude-heavy", "quick", "relaxed", "overnight"]}, "pattern": S, "interval_minutes": {"type": "number"}, "first_who": {"enum": ["claude", "codex"]}, "first_minutes": {"type": "number"}, "hours": {"type": "number"}, "max_checks": I, "note": S}, ["root", "name"]),
     "schedule_next": ("Adaptive schedule: after your check-in, say who checks next and in how many minutes (10-720), with the reason. Sooner while things move or are fragile, later while a long run is simply in progress. Works on any schedule to move the next check once.", {"root": ROOT, "name": S, "who": {"enum": ["claude", "codex"]}, "minutes": {"type": "number"}, "reason": S}, ["root", "name", "minutes"]),
     "schedule_status": ("Show the check-in schedule: cycle, who checks next and when, recent check-ins. With no schedule it lists the presets.", {"root": ROOT}, ["root"]),
     "finish": ("The project is done: stop everything that could keep running or spending in the background (check-in schedule, wakeups, running consultations, background runs, file claims), save an optional final checkpoint, and report what was stopped. pause_only=true parks the project instead (wakeups paused, can be resumed). Mail and history are kept.", {"root": ROOT, "name": S, "summary": S, "next_steps": S, "evidence": S, "pause_only": {"type": "boolean"}}, ["root", "name"]),

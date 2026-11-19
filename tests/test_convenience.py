@@ -26,7 +26,7 @@ class GitExcludeTests(unittest.TestCase):
             (Path(folder) / '.gitignore').write_text('node_modules/\n', encoding='utf-8')
             exclude = Path(folder) / '.git' / 'info' / 'exclude'
             exclude.write_text('# local excludes\n*.log', encoding='utf-8')
-            self.assertEqual(self.join(folder)['git'], 'added to .git/info/exclude')
+            self.assertEqual(self.join(folder)['git'], 'added to the local git exclude list')
             self.assertEqual(self.join(folder)['git'], 'already excluded')
             self.assertEqual(exclude.read_text(encoding='utf-8'), '# local excludes\n*.log\n.agent-duet/\n')
             self.assertEqual((Path(folder) / '.gitignore').read_text(encoding='utf-8'), 'node_modules/\n')

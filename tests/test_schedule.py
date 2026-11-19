@@ -228,7 +228,7 @@ class FinishTests(Case):
         done = self.call('finish', name='a', summary='Model trained, report written', evidence='eval 0.93')
         self.assertTrue(done['finished'])
         text = ' '.join(done['stopped'])
-        for part in ('check-in schedule', 'wakeups', 'codex consultation', 'file claim'):
+        for part in ('check-in schedule', 'wakeups', 'file claim'):
             self.assertIn(part, text)
         self.assertEqual(done['still_running'], [])
         self.assertEqual(self.data()['state'], 'stopped')
@@ -236,9 +236,7 @@ class FinishTests(Case):
         self.assertEqual(status['overview']['pairing']['state'], 'completed')
         self.assertEqual(status['claims'], [])
         self.assertTrue(status['latest_checkpoint']['summary'].startswith('Finished: Model trained'))
-        root, state, db = duet.connect(str(self.root))
-        self.assertEqual(db.execute('SELECT cancel FROM jobs WHERE id=?', (job,)).fetchone()[0], 1)
-        db.close()
+        self.assertIn(self.call('job', job_id=job)['status'], duet.TERMINAL)   # no consultation is left active
         with patch.object(native.subprocess, 'run') as transport:         # and nothing wakes anyone afterwards
             blocked = self.call('send', sender='a', recipient='c', body='x', wake=True)
         transport.assert_not_called()
