@@ -123,6 +123,42 @@ class PromptTests(unittest.TestCase):
             self.assertTrue(result['user_was_prompted'])
             self.assertIn('sign-in window was opened', result['fix'])
 
+    def test_codex_side_gets_exactly_the_same_treatment(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = {'root': folder}
+            r = duet.dispatch('join', base | dict(name='c', provider='codex', session=str(uuid.uuid4()), project_name='P', goal='G'))
+            base['project_id'] = r['project']['id']
+            duet.dispatch('join', base | dict(name='a', provider='claude', session=str(uuid.uuid4()), address='peer [abc123]', title='peer', project_name='P', goal='G'))
+            m = duet.dispatch('send', base | dict(sender='a', recipient='c', body='your turn'))['message_id']
+            with patch.object(duet, 'logged_in', side_effect=lambda provider: provider != 'codex'), \
+                 patch.object(duet, 'notify_user', return_value=True) as note, \
+                 patch.object(duet, 'open_login', return_value={'opened': True}) as window, \
+                 patch.object(native.subprocess, 'run') as transport:
+                woken = duet.dispatch('native_wake', base | dict(name='a', message_id=m))
+                with self.assertRaisesRegex(ValueError, 'codex login'):
+                    duet.dispatch('consult', base | dict(requester='a', provider='codex', prompt='review this'))
+                reachable = duet.dispatch('native_status', base | dict(check=True))['reachable']
+            self.assertFalse(any('queue' in call.args[0] for call in transport.call_args_list if call.args))  # no `codex queue` was attempted
+            self.assertEqual(woken['status'], 'not_sent')
+            self.assertTrue(woken['user_was_prompted'])
+            self.assertIn('codex login', woken['error'])
+            window.assert_called_once_with('codex')             # one window, not one per failure
+            note.assert_called_once()
+            self.assertIn('Codex', note.call_args.args[0])
+            self.assertFalse(reachable['c']['reachable'])
+            # once the user has signed in, the very same wake goes through
+            with patch.object(duet, 'cli', return_value=['codex']), \
+                 patch.object(native.subprocess, 'run', return_value=reply(0, 'Queued')):
+                self.assertEqual(duet.dispatch('native_wake', base | dict(name='a', message_id=m))['status'], 'queued')
+
+    def test_codex_sign_in_window_runs_codex_login(self):
+        with patch.object(duet, 'cli', side_effect=lambda provider: [provider]), patch.object(duet, 'logged_in', return_value=False), \
+             patch.object(duet.subprocess, 'Popen') as start, patch.object(duet.shutil, 'which', return_value='/usr/bin/xterm'):
+            result = duet.dispatch('doctor', {'login': 'codex'})
+        launched = [str(part) for part in start.call_args.args[0]]
+        self.assertEqual(launched[-2:], ['codex', 'login'])
+        self.assertEqual(result['run_this'], 'codex login')
+
     def test_notification_failure_is_harmless(self):
         with patch.object(duet.subprocess, 'Popen', side_effect=OSError('no desktop')):
             self.assertFalse(duet.notify_user('title', 'body'))
