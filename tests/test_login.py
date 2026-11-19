@@ -164,6 +164,62 @@ class PromptTests(unittest.TestCase):
             self.assertFalse(duet.notify_user('title', 'body'))
 
 
+class SelfRepairTests(unittest.TestCase):
+    def setUp(self):
+        self.home = tempfile.TemporaryDirectory()
+        env = patch.dict(os.environ, {'AGENT_DUET_HOME': self.home.name, 'AGENT_DUET_NO_LOGIN_PROMPT': '0'})
+        env.start()
+        self.addCleanup(env.stop)
+        self.addCleanup(self.home.cleanup)
+
+    def run_fix(self, signed_in, update_result=None):
+        efforts = [{'reasoningEffort': 'high'}]
+        old = [{'id': 'gpt-6.1-sol', 'model': 'gpt-6.1-sol', 'description': 'Previous generation model.', 'supportedReasoningEfforts': efforts},
+               {'id': 'gpt-6-astra', 'model': 'gpt-6-astra', 'description': 'Previous generation model.', 'supportedReasoningEfforts': efforts}]
+        new = [{'id': 'gpt-6.2-sol', 'model': 'gpt-6.2-sol', 'description': 'Latest.', 'supportedReasoningEfforts': efforts},
+               {'id': 'gpt-6.2-astra', 'model': 'gpt-6.2-astra', 'description': 'Latest.', 'supportedReasoningEfforts': efforts}]
+        catalogs = iter([old, new, new, new]) if update_result else iter([new, new, new])
+        with patch.object(duet, 'cli', side_effect=lambda provider: [provider]), \
+             patch.object(duet, 'codex_models', side_effect=lambda *a, **k: next(catalogs)), \
+             patch.object(duet, 'installed_version', return_value='cli 1.0.0'), \
+             patch.object(duet, 'latest_published', return_value='1.0.0'), \
+             patch.object(duet, 'update_cli', return_value=update_result or {}) as update, \
+             patch.object(duet, 'logged_in', side_effect=lambda provider: signed_in[provider]), \
+             patch.object(duet, 'notify_user', return_value=True), \
+             patch.object(duet, 'open_login', return_value={'opened': True}) as window, \
+             patch.object(duet.subprocess, 'run', return_value=reply(0, '9.9.999')):
+            return duet.dispatch('doctor', {'fix': True}), update, window
+
+    def test_everything_fine_says_so_and_touches_nothing(self):
+        report, update, window = self.run_fix({'codex': True, 'claude': True})
+        self.assertTrue(report['all_good'])
+        self.assertEqual((report['fixed'], report['needs_user']), ([], []))
+        self.assertEqual(report['models']['standard'], {'codex': 'gpt-6.2-sol', 'claude': 'opus'})
+        update.assert_not_called()
+        window.assert_not_called()
+
+    def test_outdated_cli_is_updated_and_reported_without_bothering_the_user(self):
+        duet.save_models_state({'auto_update': True})
+        report, update, window = self.run_fix({'codex': True, 'claude': True},
+                                              {'updated': True, 'before': 'codex-cli 0.164.0', 'after': 'codex-cli 0.170.0'})
+        update.assert_called_once_with('codex')
+        self.assertEqual(report['needs_user'], [])
+        self.assertTrue(any('0.164.0' in line and '0.170.0' in line for line in report['fixed']))
+        self.assertEqual(report['models']['hard']['codex'], 'gpt-6.2-astra')
+
+    def test_only_the_sign_in_is_left_to_the_user_and_the_window_is_already_open(self):
+        report, update, window = self.run_fix({'codex': True, 'claude': False})
+        window.assert_called_once_with('claude')
+        self.assertFalse(report['all_good'])
+        self.assertEqual(len(report['needs_user']), 1)
+        self.assertIn('sign-in window was opened', report['needs_user'][0])
+        self.assertTrue(report['ready']['consult_codex'])
+
+    def test_fix_must_be_a_real_boolean(self):
+        with self.assertRaises(ValueError):
+            duet.dispatch('doctor', {'fix': 'yes'})
+
+
 class InstallerLoginTests(unittest.TestCase):
     def test_summary_points_out_a_signed_out_cli_and_the_command(self):
         import install

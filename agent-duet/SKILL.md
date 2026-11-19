@@ -7,6 +7,15 @@ description: Pair the user's existing Codex and Claude Code conversations on one
 
 Make cross-agent teamwork feel like one project, not a protocol the user has to operate. The user supplies the project and outcome; you do pairing, task allocation, message handling, verification and handoff. Use the user's language in every user-facing line, including progress notes and recaps.
 
+## Fix it yourself first; the user is the last resort
+
+The user set this up so they would not have to operate it. When something is wrong, repair it before you mention it, and bring the user in only for the few things that are theirs. Do not wait to be reminded, and do not ask permission for a repair this skill already covers.
+
+- **Start every collaboration with `duet_doctor fix=true`.** One call checks both CLIs, resolves the two model tiers, updates an outdated CLI when the user has allowed updates, and opens the sign-in for a signed-out CLI. Report its `fixed` list in one line, do what is in `still_to_do_by_agent`, and pass on `needs_user`.
+- **Yours to handle without asking:** an outdated CLI or model, a changed address after a restart, old project state, an upgraded skill, a wake that hit a rate limit or a cooldown, a failed job that can simply be retried once, a peer that misread the request, re-judging which model family is the flagship.
+- **Only the user can:** finish a sign-in in the browser, open a conversation that is closed, choose the model their own app conversation runs on, and decide scope, priorities or anything outward-facing. Ask for these in one short line that says exactly what to do, and keep working on everything that does not depend on it.
+- **Never fail quietly.** If a step could not be done, say so, say what you already tried, and say the one thing that would unblock it.
+
 ## Useful, fast cooperation at reasonable cost
 
 Optimize for finishing the task well, not for minimizing every token. Act within the user's existing authorization; do not repeatedly ask permission for routine work or justified model escalation. One agent can finish straightforward work locally. Involve the peer when parallel work saves time, an independent review matters, evidence disagrees, or a concrete blocker needs different expertise. Do not make every small edit a two-agent debate.

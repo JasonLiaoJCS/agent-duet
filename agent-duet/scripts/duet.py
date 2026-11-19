@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 
-VERSION = "2.4.2"
+VERSION = "2.5.0"
 TERMINAL = {"completed", "failed", "cancelled", "timed_out", "interrupted"}
 FLAGS = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
@@ -1171,6 +1171,33 @@ def doctor():
         pass
     return result
 
+def doctor_fix():
+    """Check, repair what can be repaired without the user, and name what only the user can do."""
+    fixed, needs_user = [], []
+    models = None
+    try:
+        # Resolves both tiers; with the standing permission this also updates an outdated CLI.
+        models = models_report({"refresh": True})
+        for provider, result in (models.get("updates") or {}).items():
+            if result.get("updated"):
+                fixed.append("Updated the %s CLI from %s to %s." % (provider, result.get("before"), result.get("after")))
+    except Exception as exc:
+        needs_user.append("Model check failed: %s" % exc)
+    report = doctor()
+    for provider, info in report["providers"].items():
+        if info.get("logged_in") is False:
+            helped = prompt_login(provider)
+            needs_user.append("Sign the %s CLI in%s: finish the sign-in in the browser." % (
+                provider, " (a sign-in window was opened and a notification sent)" if helped.get("prompted") else " with `%s`" % ("claude auth login" if provider == "claude" else "codex login")))
+        elif "error" in info:
+            needs_user.append("Install the %s CLI and sign in: %s" % (provider, info["error"]))
+    remaining = [a for a in (models or {}).get("actions", [])]
+    report.update(fixed=fixed, needs_user=needs_user, still_to_do_by_agent=remaining,
+                  models={"standard": {"codex": (models or {}).get("codex", {}).get("standard"), "claude": (models or {}).get("claude", {}).get("standard")},
+                          "hard": {"codex": (models or {}).get("codex", {}).get("hard"), "claude": (models or {}).get("claude", {}).get("hard")}},
+                  all_good=not needs_user and not remaining and not [p for p in report["problems"] if "signed out" not in p])
+    return report
+
 def dispatch(operation, args):
     if operation.startswith('autopilot_'):
         import autopilot
@@ -1178,6 +1205,8 @@ def dispatch(operation, args):
     if operation == "doctor":
         if args.get("login"):
             return open_login(args["login"])
+        if flag(args, "fix"):
+            return doctor_fix()
         return doctor()
     if operation == "models":
         return models_report(args)
@@ -1484,7 +1513,7 @@ DEFS = {
     "autopilot_stop": ("Stop this autonomous run and cancel its current worker; keep its handoff history.",{"root":ROOT,"run_id":S},["root","run_id"]),
     "autopilot_resume": ("Resume an interrupted or unfinished autonomous run after addressing its blocker. Never resumes completed work.",{"root":ROOT,"run_id":S,"additional_turns":I,"max_hours":{"type":"number"},"instructions":S},["root","run_id"]),
     "watch": ("Bind this MCP connection to your project mailbox for Claude Code channel notifications. Requires session channel opt-in; delivery is NOT proven until you reply/ack.",{"root":ROOT,"name":S},["root","name"]),
-    "doctor": ("Check local prerequisites without invoking models: CLI versions, whether each CLI is signed in, what is ready, and the fix for every problem. login=claude|codex opens that CLI's own sign-in in a terminal window for the user to finish in their browser; use it when a CLI is signed out.", {"login": {"enum": ["claude", "codex"]}}, []),
+    "doctor": ("Check local prerequisites without invoking models: CLI versions, whether each CLI is signed in, what is ready, and the fix for every problem. fix=true is the one call to start a collaboration with: it also resolves the two model tiers, updates an outdated CLI when the user allowed that, opens the sign-in for a signed-out CLI, and returns fixed / needs_user / still_to_do_by_agent. login=claude|codex opens that CLI's own sign-in in a terminal window for the user to finish in their browser.", {"login": {"enum": ["claude", "codex"]}, "fix": {"type": "boolean"}}, []),
     "models": ("Resolve the two model tiers right now (standard=newest everyday model, hard=newest flagship) and report anything out of date, with the exact fix. Call once at the start of a collaboration, when the user says a model was released, or when a result says models_check_due. refresh=true also compares the installed CLIs with the newest published versions. update=true updates an outdated CLI itself, in the background, and reports the before/after versions. auto_update=true|false stores whether outdated CLIs are updated without asking from then on (on refresh, and before a consultation that would otherwise run on an old model). families={provider:{tier:family}} records a renamed family after you confirmed it on the vendor's model page.", {"refresh": {"type": "boolean"}, "update": {"type": "boolean"}, "auto_update": {"type": "boolean"}, "families": {"type": "object"}}, []),
     "join": ("Pair this actual session with a SPECIFIC project root and goal. Choose unique names per session and reuse your name when you come back. Pass session (your real session UUID) so the pairing survives restarts; Claude also passes address (its exact ListAgents self address) and title to bind for native wakeups in the same call, Codex is bound automatically.", {"root": ROOT, "project_name": S, "goal": S, "name": S, "provider": {"enum": ["codex", "claude"]}, "session": S, "address": S, "title": S}, ["root", "project_name", "goal", "name", "provider"]),
     "status": ("Inspect joined peers, cooperative claims and recent jobs. Recent does not prove the GUI is awake.", {"root": ROOT}, ["root"]),
