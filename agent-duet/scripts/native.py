@@ -222,7 +222,7 @@ def operate(d, op, a, root, state, db, project):
                 'next':('Address updated for the same conversation. Tell your peer through the mailbox and repeat one nonce roundtrip before relying on wakes.'
                         if rebound else 'Once both peers are bound, exchange a nonce via send/wake/reply/ack. The first wake starts the pairing.')}
     if op=='native_status':
-        attempts=[dict(r) for r in db.execute('SELECT a.*,m.ack AS recipient_ack FROM native_attempts a JOIN messages m ON m.id=a.message_id ORDER BY updated DESC LIMIT 10')]
+        attempts=[dict(r) for r in db.execute('SELECT a.*,m.ack AS recipient_ack,m.seen AS recipient_read FROM native_attempts a JOIN messages m ON m.id=a.message_id ORDER BY updated DESC LIMIT 10')]
         for item in attempts:
             details=json.loads(item.pop('result'))
             item['reported_cost_usd']=details.get('reported_cost_usd')
@@ -236,7 +236,7 @@ def operate(d, op, a, root, state, db, project):
             'run':dict(run) if run else None,'usage':usage,
             'reachable':reachability(d,root,db) if a.get('check') else 'pass check=true to test whether each conversation is open now',
             'recent_attempts':attempts,
-            'note':'Queued/attempted is not proof of an awake model. Require a matching nonce reply and recipient acknowledgment.'}
+            'note':'Queued/attempted is not proof of an awake model. recipient_read is: it is set when the peer conversation itself read the message.'}
     if op=='native_start':
         d.peer(db,a['name'])
         names=[a['name'],a['peer']]
@@ -245,7 +245,7 @@ def operate(d, op, a, root, state, db, project):
         db.commit(); db.execute('BEGIN IMMEDIATE')
         guard_supervisor(db)
         old=db.execute('SELECT * FROM native_run').fetchone()
-        same=bool(old) and {old['first_peer'],old['second_peer']}==set(names)
+        same=bool(old) and {d.conversation(db,old['first_peer']),d.conversation(db,old['second_peer'])}=={d.conversation(db,n) for n in names}
         if old and old['state']=='active' and not same:
             raise ValueError('Another native pair is active; stop it first')
         if same:
@@ -255,8 +255,8 @@ def operate(d, op, a, root, state, db, project):
             hours=float(a['max_hours']) if 'max_hours' in a else old['window']/3600
             budget=float(a.get('courier_budget_usd',old['courier_budget']))
             check_limits(cap,hours,budget)
-            db.execute("UPDATE native_run SET state='active',max_wakes=?,window=?,courier_budget=?,deadline=?",
-                       (cap,hours*3600,budget,now+FOREVER))
+            db.execute("UPDATE native_run SET state='active',max_wakes=?,window=?,courier_budget=?,deadline=?,first_peer=?,second_peer=?",
+                       (cap,hours*3600,budget,now+FOREVER,*names))
             return {'run_id':old['id'],'state':'active','attached':True,'resumed':old['state']!='active',
                     'max_wakes':cap,'max_hours':round(hours,3),'courier_budget_usd':budget,
                     'limits':'max_wakes and the courier budget apply per rolling max_hours window; the pairing itself does not expire.'}
@@ -272,7 +272,7 @@ def operate(d, op, a, root, state, db, project):
         run=db.execute('SELECT * FROM native_run').fetchone()
         if not run: raise ValueError('No native pairing to stop')
         if a.get('run_id') and a['run_id']!=run['id']: raise ValueError('That run ID is not the current pairing; omit run_id')
-        if a['name'] not in (run['first_peer'],run['second_peer']): raise ValueError('Caller is not a paired participant')
+        if d.conversation(db,a['name']) not in (d.conversation(db,run['first_peer']),d.conversation(db,run['second_peer'])): raise ValueError('Caller is not a paired participant')
         reason=a.get('state','paused')
         if reason not in ('paused','completed','needs_user'): raise ValueError('Invalid stop state')
         db.execute('UPDATE native_run SET state=?',(reason,))
@@ -291,7 +291,12 @@ def operate(d, op, a, root, state, db, project):
     previous=db.execute('SELECT * FROM native_attempts WHERE message_id=? ORDER BY updated DESC LIMIT 1',(msg['id'],)).fetchone()
     if previous: return {'status':previous['state'],'duplicate':True,'result':compact_result(json.loads(previous['result']))}
     names=[msg['sender'],msg['recipient']]
-    same=bool(run) and {run['first_peer'],run['second_peer']}==set(names)
+    # The same two conversations are the same pairing under any of their names: a conversation
+    # that rejoined with a new name keeps the limits, the usage and an explicit stop.
+    same=bool(run) and {d.conversation(db,run['first_peer']),d.conversation(db,run['second_peer'])}=={d.conversation(db,n) for n in names}
+    if same and {run['first_peer'],run['second_peer']}!=set(names) and bound_pair(db,names):
+        db.execute('UPDATE native_run SET first_peer=?,second_peer=?',names)
+        run=db.execute('SELECT * FROM native_run').fetchone()
     if run and run['state']=='active' and not same:
         raise ValueError('Wake only a message you sent to the bound peer in this pairing')
     if run and same and run['state'] not in ('active','limit_reached'):
@@ -334,12 +339,19 @@ def operate(d, op, a, root, state, db, project):
             return {'status':'courier_budget_reached','sent':False,'reported_cost_usd':0,
                     'note':'Courier estimate threshold for this window reached; the message stays in the mailbox.'}
         reservation={'accounted_cost_usd':min(0.10,remaining)}
+    try:
+        transport=d.cli(binding['provider'])
+    except Exception as exc:
+        # Nothing was sent and nothing is recorded, so the same message can be woken once the CLI is installed.
+        db.commit()
+        return {'status':'not_sent','sent':False,'error':str(exc),'processed_by_recipient':False,
+                'fix':'Install and log in to the %s CLI on this machine (duet_doctor shows what is missing); the message is safe in the mailbox.' % binding['provider']}
     db.execute('INSERT INTO native_attempts VALUES(?,?,?,?,?)',(run['id'],msg['id'],'sending',now,json.dumps(reservation)))
     db.commit()  # Claim before external effect; a crash is ambiguous, never automatically resend.
     text=notice(project,root,msg)
     try:
         if binding['provider']=='codex':
-            command=d.cli('codex')
+            command=transport
             help_result=subprocess.run(command+['queue','--help'],capture_output=True,text=True,
                                        encoding='utf-8',timeout=10,creationflags=d.FLAGS)
             resume=['--resume'] if '--resume' in help_result.stdout else []

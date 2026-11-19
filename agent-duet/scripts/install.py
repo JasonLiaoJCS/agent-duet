@@ -67,6 +67,89 @@ def optional_cli(name):
     except Exception as exc:
         return None, str(exc)
 
+def set_codex_tool_timeout(config, seconds=600):
+    """Codex stops an MCP tool call after 60 s by default, which is shorter than waiting for a
+    consultation or updating a CLI. Give this one server a longer limit; leave everything else alone.
+    The edit is written only if re-reading the file proves that nothing else changed."""
+    try:
+        import tomllib
+    except ImportError:
+        return "not changed (needs Python 3.11+ to edit config.toml safely); set tool_timeout_sec = %d under [mcp_servers.agent-duet] yourself" % seconds
+    try:
+        raw = config.read_bytes()
+        text = raw.decode("utf-8")
+        before = tomllib.loads(text)
+    except (OSError, ValueError) as exc:
+        return "not changed (%s)" % exc
+    server = before.get("mcp_servers", {}).get("agent-duet")
+    if not isinstance(server, dict):
+        return "agent-duet server entry not found"
+    if "tool_timeout_sec" in server:
+        return "already set to %s s" % server["tool_timeout_sec"]
+    lines = text.splitlines(keepends=True)
+    header = next((i for i, line in enumerate(lines)
+                   if line.split("#")[0].strip() in ("[mcp_servers.agent-duet]", '[mcp_servers."agent-duet"]', "[mcp_servers.'agent-duet']")), None)
+    if header is None:
+        return "not changed (the entry is not a plain [mcp_servers.agent-duet] table); set tool_timeout_sec = %d there yourself" % seconds
+    ending = "\r\n" if lines[header].endswith("\r\n") else "\n"
+    if not lines[header].endswith(("\n", "\r")):
+        lines[header] += ending
+    # Directly under the table header is always outside any multi-line value.
+    lines.insert(header + 1, "tool_timeout_sec = %d" % seconds + ending)
+    updated = "".join(lines)
+    try:
+        after = tomllib.loads(updated)
+    except ValueError as exc:
+        return "not changed (edit would not parse: %s)" % exc
+    expected = json.loads(json.dumps(before, default=str))
+    expected["mcp_servers"]["agent-duet"]["tool_timeout_sec"] = seconds
+    if json.loads(json.dumps(after, default=str)) != expected:
+        return "not changed (the edit would have altered other settings)"
+    tmp = config.with_name(config.name + ".agent-duet-tmp")
+    tmp.write_bytes(updated.encode("utf-8"))
+    try:
+        shutil.copymode(config, tmp)
+    except OSError:
+        pass
+    os.replace(tmp, config)
+    return "set to %d s" % seconds
+
+def upgrade_source(source):
+    """Fast-forward a git checkout of the skill before installing from it."""
+    repo = source.parent
+    git = shutil.which("git")
+    if not git or not (repo/".git").exists():
+        raise SystemExit("--upgrade needs a git checkout of Agent Duet, and this copy is not one. Nothing was changed.\n"
+                         "Download the new version from https://github.com/JasonLiaoJCS/agent-duet and run its installer.")
+    done = subprocess.run([git, "-C", str(repo), "pull", "--ff-only"], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=180, creationflags=FLAGS)
+    if done.returncode:
+        raise SystemExit("Could not update the checkout:\n" + (done.stderr or done.stdout).strip())
+    return (done.stdout or "").strip().splitlines()[-1] if (done.stdout or "").strip() else "up to date"
+
+def summary(result, missing):
+    """What a person needs to know after installing, in plain words."""
+    lines = ["", "Agent Duet %s is installed." % result["version"], ""]
+    lines.append("  Codex          : " + ("tools registered" if result["codex_mcp"] and not str(result["codex_mcp"]).startswith("skipped") else "not found on this computer"))
+    lines.append("  Claude Code    : " + ("tools registered" if result["claude_mcp"] and not str(result["claude_mcp"]).startswith("skipped") else "not found on this computer"))
+    lines.append("  Claude Desktop : " + ("tools registered" if str(result["claude_desktop"]).startswith("registered") else "not present"))
+    lines.append("  Consult workers default to: " + ("read-only (review)" if result["default_consult_mode"] == "review" else "full permissions (work)"))
+    lines.append("  Update outdated CLIs automatically: " + ("yes" if result["auto_update_cli"] else "no (enable with --auto-update on)"))
+    if result.get("upgrade"):
+        lines.append("  Source: " + result["upgrade"])
+    lines += ["", "Next:"]
+    if missing:
+        lines.append("  1. Install and log in to %s, then run this installer again to enable pairing." % " and ".join(missing))
+    else:
+        lines.append("  1. Reopen Codex and Claude Code once so they load the tools.")
+        lines.append("     (Conversations already running Agent Duet 2.4 or later switch to the new version by themselves;")
+        lines.append("      coming from 2.3 or earlier, this one reopen is needed.)")
+        lines.append("  2. In one conversation on each side, paste:")
+        lines.append("       用 agent-duet 配對這個專案：<project folder>。目標：<what you want done>。")
+    lines += ["", "Existing projects keep their mailbox, checkpoints and pairing; nothing has to be set up again.",
+              "Details as JSON: run with --json", ""]
+    return chr(10).join(lines)
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--codex-home", type=Path, default=Path(os.environ.get("CODEX_HOME", str(Path.home()/".codex"))))
@@ -78,9 +161,18 @@ def main():
     parser.add_argument("--auto-update", choices=["on", "off"],
                         help="Let Agent Duet update an outdated codex/claude CLI by itself so consultations never run on an "
                              "old model. Omitted keeps the previous choice (off on a fresh install).")
+    parser.add_argument("--upgrade", action="store_true",
+                        help="Fetch the newest version first (git pull in this checkout), then install it.")
+    parser.add_argument("--json", action="store_true", help="Print the full result as JSON instead of a summary.")
     args = parser.parse_args()
     if sys.version_info < (3, 10):
         raise SystemExit("Agent Duet needs Python 3.10+ (3.11+ recommended).")
+    if args.upgrade and os.environ.get("AGENT_DUET_UPGRADED") != "1":
+        note = upgrade_source(Path(__file__).resolve().parents[1])
+        # Install with the code that was just fetched, not the copy already loaded in this process.
+        forwarded = [a for a in sys.argv[1:] if a != "--upgrade"]
+        env = dict(os.environ, AGENT_DUET_UPGRADED="1", AGENT_DUET_UPGRADE_NOTE=note)
+        raise SystemExit(subprocess.run([sys.executable, "-X", "utf8", str(Path(__file__).resolve())] + forwarded, env=env).returncode)
     custom_claude_home = args.claude_home
     args.claude_home = args.claude_home or Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home()/".claude")))
     source = Path(__file__).resolve().parents[1]
@@ -119,6 +211,7 @@ def main():
         # Re-adding replaces only this server's own entry.
         subprocess.run(codex + ["mcp", "remove", "agent-duet"], capture_output=True, env=codex_env, timeout=30, creationflags=FLAGS)
         result["codex_mcp"] = run(codex + ["mcp", "add", "agent-duet", "--", sys.executable, str(codex_dest/"scripts/duet.py"), "mcp"], codex_env) or "registered"
+        result["codex_tool_timeout"] = set_codex_tool_timeout(args.codex_home/"config.toml")
     else:
         result["codex_mcp"] = "skipped: " + codex_error
     if claude:
@@ -153,7 +246,10 @@ def main():
     result["next"] = ("Reload Codex and Claude once. Then paste the same one-line pairing request into one conversation on each side."
                       if not missing else
                       "Installed for the available client. Install and log in to %s, then rerun this installer to enable native pairing." % " and ".join(missing))
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    result["version"] = _duet.VERSION
+    if os.environ.get("AGENT_DUET_UPGRADE_NOTE"):
+        result["upgrade"] = os.environ["AGENT_DUET_UPGRADE_NOTE"]
+    print(json.dumps(result, ensure_ascii=False, indent=2) if args.json else summary(result, missing))
 
 if __name__ == "__main__":
     main()

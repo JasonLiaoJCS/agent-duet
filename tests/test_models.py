@@ -115,7 +115,7 @@ class SelfUpdateTests(unittest.TestCase):
         self.addCleanup(self.home.cleanup)
 
     def test_update_true_updates_then_reports_the_new_resolution(self):
-        catalogs = iter([OUTDATED, CURRENT])
+        catalogs = iter([OUTDATED, [m for m in CURRENT if 'luna' not in m['model']]])  # same families, newer versions
         versions = {'codex': ['codex-cli 0.1.0', 'codex-cli 0.2.0'], 'claude': ['2.0.0', '2.0.0']}
         calls = []
 
@@ -147,6 +147,23 @@ class SelfUpdateTests(unittest.TestCase):
         self.assertEqual(routing['model'], 'gpt-6.2-sol')
         self.assertNotIn('warning', routing)
         self.assertTrue(routing['cli_update']['updated'])
+
+    def test_a_newer_cli_is_picked_up_within_a_day_even_before_the_catalog_looks_old(self):
+        duet.save_models_state({'auto_update': True})
+        catalogs = iter([[model('gpt-6.2-sol'), model('gpt-6.2-astra')], [model('gpt-6.3-sol'), model('gpt-6.2-astra')], [model('gpt-6.3-sol')]])
+        with patch.object(duet, 'codex_models', side_effect=lambda *a, **k: next(catalogs)),              patch.object(duet, 'installed_version', return_value='codex-cli 0.170.0'),              patch.object(duet, 'latest_published', return_value='0.171.0') as registry,              patch.object(duet, 'update_cli', return_value={'updated': True, 'before': 'codex-cli 0.170.0', 'after': 'codex-cli 0.171.0'}) as update:
+            first = duet.route('codex', 'standard', 'high')
+            second = duet.route('codex', 'standard', 'high')
+        self.assertEqual(first['model'], 'gpt-6.3-sol')       # the release is used by the very next consultation
+        self.assertEqual(update.call_count, 1)
+        self.assertEqual(registry.call_count, 1)              # and the registry is asked at most once a day
+        self.assertEqual(second['model'], 'gpt-6.3-sol')
+
+    def test_no_network_lookup_or_update_without_standing_permission(self):
+        with patch.object(duet, 'codex_models', return_value=[model('gpt-6.2-sol')]),              patch.object(duet, 'latest_published') as registry, patch.object(duet, 'update_cli') as update:
+            duet.route('codex', 'standard', 'high')
+        registry.assert_not_called()
+        update.assert_not_called()
 
     def test_failed_update_is_not_retried_on_every_job(self):
         duet.save_models_state({'auto_update': True})

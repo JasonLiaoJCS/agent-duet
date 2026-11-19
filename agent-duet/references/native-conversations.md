@@ -39,7 +39,7 @@ There is also a 20-second burst interval per recipient. `cooldown` means nothing
 
 ## Verify both directions before claiming connected
 
-Send a short handshake with `duet_send` containing a random nonce, the expected root and project ID, and a request for that nonce, the receiving session's identity and one brief fact from its own context. Wake it. The peer reads its inbox, checks project, root and goal against its own context, replies with `reply_to`, acknowledges, and wakes the initiator with that reply. The initiator compares nonce, identity and reply reference, acknowledges, and saves a checkpoint.
+Send a short handshake with `duet_send wake=true` containing a random nonce, the expected root and project ID, and a request for that nonce, the receiving session's identity and one brief fact from its own context. An early sign arrives without any effort: `duet_inbox.awaiting_peer` shows `read_by_peer: true` once the peer's own conversation has fetched the message. The proof is the reply: the peer checks project, root and goal against its own context and replies with `reply_to`, `kind=result` and `wake=true`, which also closes the handshake message. The initiator compares nonce and identity and saves a checkpoint.
 
 One roundtrip in each direction, then stop; never exchange acknowledgments of acknowledgments. `queued` means the Codex CLI accepted the queue operation; `attempted` means the courier called `SendMessage`. Neither means the model answered. With no receipt, report `awaiting verification` and the precise corrective action. A timeout has an unknown outcome: waking again with the same message ID never resends, so inspect the inbox first.
 

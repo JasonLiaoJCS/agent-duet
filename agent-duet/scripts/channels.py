@@ -9,7 +9,7 @@ class ChannelWatch:
         self.thread=threading.Thread(target=self.loop,daemon=True)
         self.thread.start()
     def bind(self,args):
-        self.dispatch('inbox',args)
+        self.dispatch('inbox',dict(args,peek=True))  # validate the binding without producing a read receipt
         with self.lock:
             if self.binding and self.binding!=args:
                 raise ValueError('This MCP connection is already bound to a different participant/project; reconnect before changing it')
@@ -24,7 +24,7 @@ class ChannelWatch:
             if not binding:
                 continue
             try:
-                rows=self.dispatch('inbox',binding)['messages']
+                rows=self.dispatch('inbox',dict(binding,peek=True))['messages']
                 for row in rows:
                     if row['id'] in self.seen:
                         continue

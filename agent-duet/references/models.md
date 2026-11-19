@@ -7,7 +7,9 @@ The user never edits a model name. Two roles are fixed; the model that fills eac
 | `standard` | Everyday work; the default | `sol` | `opus` |
 | `hard` | The flagship, only for genuinely hard tasks, with a recorded reason | `astra` | `fable` |
 
-Versions are examples only and go stale by design. When this page was last revised (2026-11-19) the roles resolved to GPT-6.2 Sol / Claude Opus 5.5 and GPT-6.2 Astra / Claude Fable 5.2. Effort is `high`; raise it to a supported `xhigh` or `max` only for a stated reason. A harder reasoning level and a more expensive family are two separate decisions.
+Versions are examples only and go stale by design. When this page was last revised (2026-11-19) the roles resolved to GPT-6.2 Sol / Claude Opus 5.5 and GPT-6.2 Astra / Claude Fable 5.2. Effort defaults to `high`. Use `medium` for simple mechanical work, and a supported `xhigh` or `max` only for a stated reason. A harder reasoning level and a more expensive family are two separate decisions.
+
+The roles, not the names, are the policy. The flagship is the best model a vendor currently offers; the everyday model is the newest one that is clearly cheaper and suited to heavy daily use. When a vendor's line-up changes, the agent decides which family now fills each role from the official pages below and records it. The goal is the user's balance: quota that lasts, and work that is still done well.
 
 ## How resolution works
 
@@ -36,7 +38,7 @@ Fix: `npm install -g @openai/codex@latest` (and `claude update` for Claude Code)
 
 ## When a family changes
 
-Vendors occasionally rename a line or put a new one on top. The catalog cannot tell which family is the flagship, so this needs one check by an agent, not by the user: read the official pages below, decide which family is the everyday line and which is the flagship, and store them with `families=`. `catalog` in the report shows every family the CLI can see, which makes a new or renamed one easy to spot. Never guess a family from its name.
+Vendors occasionally rename a line or put a new one on top. The catalog cannot tell which family is the flagship, but it shows when the line-up moved: `duet_models` compares the families it sees with the snapshot taken at the last review and adds a `review_roles` action when a new family appears or another family overtakes one of the tiers. Passing `families=` (even unchanged) confirms the review and resets the snapshot. The judgement itself needs one check by an agent, not by the user: read the official pages below, decide which family is the everyday line and which is the flagship, and store them with `families=`. `catalog` in the report shows every family the CLI can see, which makes a new or renamed one easy to spot. Never guess a family from its name.
 
 - [OpenAI model guidance](https://developers.openai.com/api/docs/guides/latest-model)
 - [Codex app-server and model/list](https://learn.chatgpt.com/docs/app-server)
