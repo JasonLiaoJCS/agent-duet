@@ -18,4 +18,5 @@ for _name in ('codex', 'claude'):
 os.environ['AGENT_DUET_ASSUME_LOGIN'] = '1'
 os.environ['AGENT_DUET_NO_LOGIN_PROMPT'] = '1'  # a test must never open a window or a notification
 os.environ['AGENT_DUET_NO_SCHEDULER'] = '1'     # tests drive the timer by hand; no background process is started
+os.environ['AGENT_DUET_OFFLINE'] = '1'          # no test reaches the network; lookups are mocked where needed
 atexit.register(shutil.rmtree, _home, ignore_errors=True)

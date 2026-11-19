@@ -30,6 +30,15 @@ Options: `refresh=true` also fetches the newest published CLI versions from the 
 
 Call it at the first use in a collaboration, when the user says a model was released, and when any result says `models_check_due`.
 
+## Your part
+
+- **First use in a collaboration:** `duet_doctor fix=true` (or `duet_models`) resolves both tiers. Tell the user in one line which exact models they resolve to.
+- **When the user says a model was released** (有模型更新), or a result carries `models_check_due`: `duet_models refresh=true`. It also compares the installed CLIs, and Agent Duet itself, with the newest published versions.
+- **Changing the machine needs permission; reading never does.** `update=true` is a one-time update the user agreed to now. `auto_update=true` is a standing permission, set once when the user has said that tools may be installed or updated without asking each time (ask once if they have not). With it, an outdated CLI is updated in the background on every refresh, and an outdated Codex CLI also right before a consultation that would otherwise run one model version behind. Claude's aliases resolve on the vendor side, so its CLI version does not change the model. A CLI that is busy with a job is left alone and retried at the next check; a failed update is reported with its reason, never as success.
+- **Report an update in one line:** old version, new version, and the models the two tiers now resolve to.
+- **Choosing the tier is yours.** Default to `standard` at `high`. Use `medium` for work that needs no deep reasoning (formatting, renames, lookups). Go to `hard` when a task has already resisted a real attempt or a wrong answer would be expensive; give the reason, and come back down afterwards. Once the user has agreed to this policy, do not ask again for each change.
+- **Check the evidence:** `routing.model` and `actual_models` in each job result. Never substitute a model yourself; the bridge's declared fallback is the only substitution.
+
 ## The failure this prevents
 
 A Codex CLI only lists models that existed when it was built. Left un-updated, it keeps resolving the newest model *it knows*, and its catalog then describes that model as a "previous generation" or "legacy" model. Consultations ran one version behind for two weeks this way before anyone looked. The bridge now treats those words on the selected model as evidence of a stale CLI: `duet_models` puts the update command in `actions`, and each job records `routing.warning`.

@@ -102,25 +102,39 @@ def parse_watch(root, text):
     return patterns
 
 
-def fingerprint(root, patterns):
-    """Cheap change detector: names, sizes and modification times of the watched files."""
-    seen = []
+SCAN_LIMIT = 2000
+
+
+def scan(root, patterns):
+    """(fingerprint, files matched, truncated). Names, sizes and nanosecond modification times of the
+    watched files: cheap, and a rewrite within the same second still shows."""
+    seen, truncated = [], False
     for pattern in patterns:
+        if truncated:
+            break
         try:
             matches = sorted(Path(root).glob(pattern))
         except (OSError, ValueError):
             continue
         for match in matches:
-            files = [match] if match.is_file() else sorted(p for p in match.rglob("*") if p.is_file()) if match.is_dir() else []
+            files = [match] if match.is_file() else (p for p in match.rglob("*") if p.is_file()) if match.is_dir() else []
             for path in files:
                 try:
                     info = path.stat()
-                    seen.append((path.relative_to(root).as_posix(), info.st_size, int(info.st_mtime)))
+                    seen.append((path.relative_to(root).as_posix(), info.st_size, info.st_mtime_ns))
                 except (OSError, ValueError):
                     continue
-                if len(seen) >= 500:
+                if len(seen) >= SCAN_LIMIT:
+                    truncated = True
                     break
-    return hashlib.sha1(json.dumps(sorted(seen)).encode()).hexdigest() if seen else "nothing matched"
+            if truncated:
+                break
+    digest = hashlib.sha1(json.dumps(sorted(seen)).encode()).hexdigest() if seen else "nothing matched"
+    return digest, len(seen), truncated
+
+
+def fingerprint(root, patterns):
+    return scan(root, patterns)[0]
 
 
 def other(provider):
@@ -186,7 +200,8 @@ def launch(root):
 
 
 def start_timer(root, db):
-    """Start exactly one timer: the right to start is claimed inside a write transaction."""
+    """Start exactly one timer. The right to start is a one-time token claimed inside a write
+    transaction, so a starter that was slow can never overwrite the timer another one registered."""
     if os.environ.get("AGENT_DUET_NO_SCHEDULER") == "1":
         return None
     now = time.time()
@@ -194,18 +209,36 @@ def start_timer(root, db):
     if not data or data.get("state") != "active" or alive(data) or now - float(data.get("claimed_at") or 0) < 30:
         db.commit()
         return None
-    data["claimed_at"] = now
+    token = uuid.uuid4().hex
+    data.update(claimed_at=now, claim=token)
     save(db, data)
     db.commit()
     proc = launch(root)
     current = write(db)
-    if current and current.get("id") == data.get("id") and current.get("state") == "active":
+    if current and current.get("id") == data.get("id") and current.get("state") == "active" and current.get("claim") == token:
         # The claim only covers the instant of launching. Once the timer is recorded, a later death
         # (a reboot, a kill) is noticed from its process identity and it is restarted at once.
-        current.update(pid=proc.pid, birth=duet.process_birth(proc.pid), claimed_at=None)
+        current.update(pid=proc.pid, birth=duet.process_birth(proc.pid), claimed_at=None, claim=None)
         save(db, current)
-    db.commit()
+    db.commit()  # if the token no longer matches, the timer we launched finds another owner and exits
     return proc.pid
+
+
+def resume(root, db, now):
+    """Bring back a schedule that was parked with a pause. Returns True when one was resumed."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schedule'").fetchone():
+        return False
+    data = write(db)
+    if not data or data.get("state") != "paused" or now >= data.get("until", 0):
+        db.commit()
+        return False
+    step = data["pattern"][data["index"] % len(data["pattern"])][1]
+    data.update(state="active", ended=None, next_due=now + step * 60, pid=None, birth=None, claimed_at=None,
+                rev=int(data.get("rev", 0)) + 1)
+    save(db, data)
+    db.commit()
+    start_timer(root, db)
+    return True
 
 
 def ensure_running(root, db):
@@ -282,8 +315,13 @@ def operate(op, a):
             if a.get("around_minutes") is not None:
                 around = minutes_ok(a["around_minutes"])
             fallback = minutes_ok(a.get("interval_minutes", around or 60))
-            pattern = [(first_who, fallback), (other(first_who), fallback)]
             first_minutes = minutes_ok(a.get("first_minutes", min(45, fallback)))
+            if around and strict:
+                # A strict scale binds every interval, including the first check and the fallback.
+                low, high = max(MIN_MINUTES, around / 2), min(MAX_MINUTES, around * 2)
+                fallback = min(high, max(low, fallback))
+                first_minutes = min(high, max(low, first_minutes))
+            pattern = [(first_who, fallback), (other(first_who), fallback)]
         else:
             if mode == "custom":
                 pattern = parse_pattern(a.get("pattern") or "")
@@ -303,6 +341,7 @@ def operate(op, a):
         if not 0.5 <= hours <= 168:
             raise ValueError("hours must be between 0.5 and 168 (one week); set it again to continue longer")
         watch = parse_watch(root, a.get("watch"))
+        watch_fp, matched, truncated = scan(root, watch) if watch else (None, 0, False)  # before the write transaction
         longest = max(minutes for _, minutes in pattern)
         quiet = minutes_ok(a.get("max_quiet_minutes", min(1440, longest * 4)), 30, 1440)
         write(db)
@@ -312,14 +351,20 @@ def operate(op, a):
                 "next_who": first_who, "next_due": now + first_minutes * 60, "next_reason": None, "awaiting_next": False,
                 "started": now, "until": now + hours * 3600, "checks_done": 0, "ticks": 0, "skipped": 0,
                 "max_checks": int(a.get("max_checks", 200)), "note": str(a.get("note") or "")[:500], "set_by": a["name"],
-                "participants": names, "watch": watch, "watch_fp": fingerprint(root, watch) if watch else None,
+                "participants": names, "watch": watch, "watch_fp": watch_fp,
                 "max_quiet": quiet * 60, "last_real_check": now, "history": [], "pid": None, "birth": None}
         save(db, data)
         # Asking for a schedule is asking for wakeups: a pairing that was paused or finished is active again.
         resumed = bool(db.execute("UPDATE native_run SET state='active' WHERE state IN ('paused','needs_user','completed','limit_reached')").rowcount)
         db.commit()
         start_timer(root, db)
-        return describe(load(db), now) | {"started": True, "wakeups_resumed": resumed}
+        warnings = []
+        if watch and matched == 0:
+            warnings.append("watch matches no file yet (%s). If that is a typo, set the schedule again; until a file appears, "
+                            "a check-in only happens after the quiet limit." % ", ".join(watch))
+        if truncated:
+            warnings.append("watch matches more than %d files; only the first %d are compared. Narrow the pattern." % (SCAN_LIMIT, SCAN_LIMIT))
+        return describe(load(db), now) | {"started": True, "wakeups_resumed": resumed} | ({"warnings": warnings} if warnings else {})
     finally:
         db.close()
 
@@ -349,9 +394,10 @@ def check_in_text(data, number, project, missed=0, why=None):
     return "\n".join(lines)
 
 
-def prepare(root, db, data, now):
+def prepare(root, db, data, now, watch_fp=None):
     """Decide what this due check-in is, write its mail, and move the schedule on. No transport here.
-    Returns (history entry, message id to wake or None)."""
+    Returns (history entry, message id to wake or None). The timer passes watch_fp, computed before
+    its write transaction, so scanning files never holds the mailbox."""
     project = db.execute("SELECT * FROM project WHERE singleton=1").fetchone()
     who = data["next_who"]
     recipient = (data.get("participants") or {}).get(who) or participant(db, who)
@@ -372,16 +418,15 @@ def prepare(root, db, data, now):
         entry["result"] = "skipped: the collaboration is " + paused
     else:
         seen = db.execute("SELECT seen FROM peers WHERE name=?", (recipient,)).fetchone()["seen"] or 0
-        changed = None
+        changed, current = None, None
         if data.get("watch"):
-            current = fingerprint(root, data["watch"])
+            current = watch_fp or fingerprint(root, data["watch"])
             changed = current != data.get("watch_fp")
             quiet_for = now - float(data.get("last_real_check") or data["started"])
             if changed:
                 why = "The watched files changed since the last check: " + ", ".join(data["watch"])
             elif quiet_for >= data.get("max_quiet", 4 * 3600):
                 why = "The watched files have not changed for %d minutes; check that the run is still alive." % round(quiet_for / 60)
-            data["watch_fp"] = current
         if now - seen < min(15, step_minutes / 3) * 60:
             # It used the bridge minutes ago, so it is in the middle of a turn. A wake would only queue a second one.
             entry["result"] = "skipped: that conversation was active %d minutes ago" % round((now - seen) / 60)
@@ -402,6 +447,10 @@ def prepare(root, db, data, now):
             message_id = cur.lastrowid
             data["checks_done"] = number
             data["last_real_check"] = now
+            if current is not None:
+                # The baseline moves only when a check-in was really handed over, so a change seen
+                # while that side was busy is still pending at the next check.
+                data["watch_fp"] = current
             entry.update(number=number, result="check-in left in the mailbox")
     if message_id is None:
         data["skipped"] = int(data.get("skipped", 0)) + 1
@@ -415,12 +464,14 @@ def prepare(root, db, data, now):
     return entry, message_id
 
 
-def deliver(root, db, message_id):
-    """Wake the conversation the check-in is addressed to. Returns a short result for the history."""
+def deliver(root, db, message_id, schedule_id=None):
+    """Wake the conversation the check-in is addressed to. Returns a short result for the history.
+    The wake itself re-checks, inside its own transaction, that this schedule is still active."""
     project = db.execute("SELECT * FROM project WHERE singleton=1").fetchone()
     try:
         import native
-        woke = native.operate(duet, "native_wake", {"name": "scheduler", "message_id": message_id, "_system": True},
+        woke = native.operate(duet, "native_wake", {"name": "scheduler", "message_id": message_id, "_system": True,
+                                                    "_schedule_id": schedule_id},
                               root, root / ".agent-duet", db, project)
         db.commit()
         return "woken: " + str(woke.get("status")) + ((" (" + str(woke["error"])[:160] + ")") if woke.get("error") else "")
@@ -434,7 +485,7 @@ def fire(root, db, data, now):
     entry, message_id = prepare(root, db, data, now)
     db.commit()
     if message_id is not None:
-        entry["result"] = deliver(root, db, message_id)
+        entry["result"] = deliver(root, db, message_id, data.get("id"))
     return entry
 
 
@@ -443,6 +494,10 @@ def runner(root):
     while True:
         root_path, state, db = duet.connect(root)
         try:
+            glance = load(db)
+            watch_fp = None
+            if glance and glance.get("state") == "active" and glance.get("watch") and glance["next_due"] <= time.time():
+                watch_fp = fingerprint(root_path, glance["watch"])  # outside the write transaction
             data = write(db)
             if not data or data.get("state") != "active":
                 db.commit()
@@ -474,12 +529,12 @@ def runner(root):
             if wait <= 0:
                 # After sleep or a long pause several checks may be overdue: do one, then count from now.
                 # The decision, the mail and the next due time are saved in this one transaction.
-                entry, message_id = prepare(root_path, db, data, now)
+                entry, message_id = prepare(root_path, db, data, now, watch_fp)
                 save(db, data)
                 wait = 5
             db.commit()
             if message_id is not None:
-                result = deliver(root_path, db, message_id)
+                result = deliver(root_path, db, message_id, data.get("id"))
                 # Only the outcome of this check is added afterwards, to whatever the schedule is now:
                 # a schedule that was stopped or changed during the wake stays exactly as it was left.
                 current = write(db)

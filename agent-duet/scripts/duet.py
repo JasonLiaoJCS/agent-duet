@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 
-VERSION = "2.9.0"
+VERSION = "3.0.0"
 TERMINAL = {"completed", "failed", "cancelled", "timed_out", "interrupted"}
 FLAGS = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
@@ -194,6 +194,48 @@ def stable_session(session):
         return str(uuid.UUID(session or ""))
     except (ValueError, AttributeError, TypeError):
         return None
+
+GIT_FOOTER = re.compile(r"\n\n\[git: [^\n\]]*\]\Z")
+
+def git_context(root):
+    """One line saying which version of the code a result refers to. It is a pointer for the
+    reviewer, not a lock: untracked files are not listed, and the tree may move afterwards."""
+    git = shutil.which("git")
+    if not git or not (root / ".git").exists():
+        return None
+    def run(*args, limit=20000):
+        # No file-system monitor hook, plain UTF-8 paths, and never more output than we will use.
+        proc = subprocess.Popen([git, "-c", "core.fsmonitor=false", "-c", "core.quotepath=false", "-C", str(root), *args],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, creationflags=FLAGS)
+        try:
+            data = proc.stdout.read(limit)
+            more = bool(proc.stdout.read(1))
+        finally:
+            if proc.poll() is None:
+                try:
+                    proc.kill() if more else proc.wait(timeout=10)
+                except Exception:
+                    proc.kill()
+            proc.stdout.close()
+        code = proc.wait(timeout=10)
+        return (data.decode("utf-8", "replace"), more) if (code == 0 or more) else (None, False)
+    try:
+        commit = (run("rev-parse", "--short", "HEAD")[0] or "").strip()
+        if not commit:
+            return None  # a repository without a commit has no version to name
+        branch = (run("rev-parse", "--abbrev-ref", "HEAD")[0] or "").strip()
+        status, more = run("status", "--porcelain", "--untracked-files=no")
+        # Porcelain lines are "XY path": the two status columns may be spaces, so never strip the line first.
+        lines = (status or "").splitlines()
+        if more and lines:
+            lines = lines[:-1]  # the last line may be cut in the middle
+        changed = [line[3:].strip().strip('"') for line in lines if len(line) > 3]
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    note = "git: %s@%s" % ("detached" if branch in ("", "HEAD") else branch, commit)
+    if changed:
+        note += ", %d%s uncommitted tracked: %s%s" % (len(changed), "+" if more else "", ", ".join(changed[:6]), " …" if len(changed) > 6 or more else "")
+    return "[" + note.replace("]", ")") + "]"
 
 def keep_out_of_git(root):
     """The mailbox can hold project content and must not end up in a commit. Add it to this clone's
@@ -681,6 +723,8 @@ def parse_version(text):
 
 def latest_published(package):
     """Newest published CLI version from the npm registry; None when offline."""
+    if os.environ.get("AGENT_DUET_OFFLINE") == "1":
+        return None
     import urllib.request
     try:
         url = NPM_REGISTRY + package.replace("/", "%2F") + "/latest"
@@ -708,7 +752,7 @@ def logged_in(provider):
     try:
         command = cli(provider) + (["auth", "status"] if provider == "claude" else ["login", "status"])
         done = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                              timeout=20, creationflags=FLAGS, stdin=subprocess.DEVNULL)
+                              timeout=8, creationflags=FLAGS, stdin=subprocess.DEVNULL)
     except Exception:
         return None
     text = ((done.stdout or "") + (done.stderr or "")).strip()
@@ -828,11 +872,12 @@ def prompt_login(provider, minutes=30):
                              if opened else
                              ("The %s CLI is signed out. A desktop notification was sent; ask the user to run `%s` and finish the sign-in." % (name, command))}
 
+def signed_out_message(provider):
+    return f"The {provider} CLI on this computer is signed out (the desktop app keeps a separate login). " + LOGIN_FIX[provider]
+
 def login_problem(provider):
     """A sentence for the user when this CLI is definitely signed out, else None."""
-    if logged_in(provider) is False:
-        return f"The {provider} CLI on this computer is signed out (the desktop app keeps a separate login). " + LOGIN_FIX[provider]
-    return None
+    return signed_out_message(provider) if logged_in(provider) is False else None
 
 def cli_in_use(provider):
     """Best effort: is an npm-installed CLI of this provider running right now (for example a bridge job)?"""
@@ -1064,6 +1109,11 @@ def models_report(a):
               "resolution": "rolling aliases; the newest member is chosen by Claude Code at run time",
               "last_observed": observed}
     if a.get("refresh"):
+        newest = latest_release()
+        report["agent_duet"] = {"installed": VERSION, "latest": newest}
+        if newest and parse_version(newest) and parse_version(VERSION) and parse_version(newest) > parse_version(VERSION):
+            actions.append(f"Agent Duet {newest} is available (this is {VERSION}): call duet_doctor with upgrade=true, "
+                           "or tell the user the one phrase 更新 agent-duet.")
         for provider, info in (("codex", codex), ("claude", claude)):
             latest = latest_published(NPM_PACKAGES[provider])
             info["latest_published"] = latest
@@ -1436,6 +1486,74 @@ def doctor_fix():
                   all_good=not needs_user and not unknown and not remaining and not [p for p in report["problems"] if "signed out" not in p])
     return report
 
+REPOSITORY = "JasonLiaoJCS/agent-duet"
+GUIDE = [
+    # (the user's situation, what they can say, what the agent does)
+    ("第一次在這個專案使用", "用 agent-duet 配對這個專案：<完整路徑>。目標：<要完成的事>",
+     "duet_doctor fix=true, then duet_join with the session UUID; verify both directions once"),
+    ("想知道做到哪了", "目前進度", "duet_status (overview), duet_inbox; act on attention first"),
+    ("想先停一下", "先暫停", "duet_finish pause_only=true (parks the wakeups and the schedule)"),
+    ("隔天、重開機後，或暫停之後", "繼續", "duet_native_status check=true; duet_native_start if it was paused (also resumes the schedule); duet_inbox; latest checkpoint"),
+    ("想換方向", "目標改成……", "agree with the peer, then duet_set_goal"),
+    ("想指定誰主導", "這次由 Claude 主導，Codex 負責審查", "record the roles in the handshake"),
+    ("只想請另一家看一段東西", "用 agent-duet 請 Codex 審查 <檔案或問題>", "duet_consult, then duet_job wait_seconds"),
+    ("這題很難", "這個用旗艦模型", "tier=hard with a reason; return to standard afterwards"),
+    ("出了新模型", "有模型更新", "duet_models refresh=true; re-judge roles if review_roles appears"),
+    ("長期任務要定時回來看", "用 agent-duet 排班：輪流／Codex 多一點／Claude 多一點／密集／寬鬆／過夜／自訂：…／你們自己決定",
+     "duet_schedule (read references/schedule.md)"),
+    ("長時間訓練，不想白白叫醒", "…排班：輪流，盯著 <檔案>，有變化才叫醒", "duet_schedule watch=..."),
+    ("想看或取消排班", "排班狀況／取消排班", "duet_schedule_status / duet_schedule mode=off"),
+    ("想讓它們自己做完", "用 agent-duet 在背景完成：<任務>。驗收標準：<條件>", "duet_autopilot_start"),
+    ("覺得哪裡怪怪的", "檢查一下 agent-duet", "duet_doctor fix=true"),
+    ("CLI 被登出", "（它會自己跳通知並開登入視窗）在瀏覽器完成登入後說「登入好了」", "repeat the refused wake or consultation"),
+    ("想更新這個工具", "更新 agent-duet", "duet_doctor upgrade=true"),
+    ("專案做完了", "agent-duet 收工", "duet_finish with a one-line summary"),
+    ("忘了可以說什麼", "agent-duet 可以做什麼", "duet_guide"),
+]
+
+def guide():
+    """What the user can say, for the agent to show them in their own language."""
+    return {"version": VERSION,
+            "how_to_use": "Show this as a short table in the user's language. These are examples, not fixed commands: the user may say them any way they like.",
+            "phrases": [{"when": when, "say": say, "agent_does": does} for when, say, does in GUIDE],
+            "defaults": {"schedule": "none until asked", "background run": "none until asked", "model": "everyday tier at high effort",
+                         "consultant permissions": default_mode(), "auto update of outdated CLIs": auto_update_enabled()},
+            "docs": "https://github.com/%s#readme" % REPOSITORY}
+
+def latest_release():
+    """Newest published Agent Duet version, read from the repository; None when offline."""
+    if os.environ.get("AGENT_DUET_OFFLINE") == "1":
+        return None
+    import urllib.request
+    try:
+        url = "https://raw.githubusercontent.com/%s/main/agent-duet/scripts/duet.py" % REPOSITORY
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "agent-duet"}), timeout=10) as reply:
+            found = re.search(r'^VERSION = "([^"]+)"', reply.read(4000).decode("utf-8", "replace"), re.M)
+            return found[1] if found else None
+    except Exception:
+        return None
+
+def self_upgrade():
+    """Fetch the newest Agent Duet into the checkout it was installed from and install it again.
+    Only on request: this runs code that was just downloaded."""
+    source = settings().get("source_checkout")
+    if not source or not (Path(source) / "scripts" / "install.py").is_file():
+        return {"upgraded": False, "manual": "This copy was not installed from a git checkout, so it cannot fetch updates by itself. "
+                                             "Download the new version from https://github.com/%s and run its installer." % REPOSITORY}
+    before = VERSION
+    try:
+        done = subprocess.run([sys.executable, "-X", "utf8", str(Path(source) / "scripts" / "install.py"), "--upgrade", "--no-login-prompt", "--json"],
+                              capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=420, creationflags=FLAGS,
+                              stdin=subprocess.DEVNULL)
+    except Exception as exc:
+        return {"upgraded": False, "error": str(exc)}
+    after = disk_version()
+    if done.returncode:
+        return {"upgraded": False, "before": before, "error": ((done.stderr or done.stdout) or "installer failed").strip()[-600:]}
+    return {"upgraded": after != before, "before": before, "after": after,
+            "note": "Already the newest version." if after == before else
+                    "Installed. This conversation switches to the new version by itself; existing projects keep their mailbox and pairing."}
+
 def finish(a):
     """The project is done (or parked): stop everything that could keep running or spending in the
     background, and say what was stopped. Mail, checkpoints and history stay on disk."""
@@ -1450,9 +1568,9 @@ def finish(a):
         peer(db, a["name"])
         now = time.time()
         shifts.table(db)
-        plan, timer = shifts.stop(db, now)
+        plan, timer = shifts.stop(db, now, "paused" if park else "stopped")
         if plan:
-            stopped.append("check-in schedule (after %d checks)" % plan.get("checks_done", 0))
+            stopped.append("check-in schedule (%s after %d checks)" % ("paused" if park else "ended", plan.get("checks_done", 0)))
         if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='native_run'").fetchone():
             run = db.execute("SELECT * FROM native_run").fetchone()
             target = "paused" if park else "completed"
@@ -1505,7 +1623,11 @@ def finish(a):
         try:
             import autopilot
             autopilot.operate("autopilot_stop", {"root": a["root"], "project_id": a["project_id"], "run_id": run_id})
-            stopped.append("background run " + run_id[:8])
+            state_now = autopilot.operate("autopilot_status", {"root": a["root"], "project_id": a["project_id"], "run_id": run_id}).get("state")
+            if state_now in autopilot.FINISHED:
+                stopped.append("background run " + run_id[:8])
+            else:
+                still.append("background run %s was told to stop and is still ending (%s)" % (run_id[:8], state_now))
         except Exception as exc:
             still.append("background run %s could not be stopped: %s" % (run_id[:8], exc))
     if timer and timer[0]:
@@ -1526,7 +1648,9 @@ def finish(a):
                     if not still else "See still_running.",
             "note": "A turn that is already running in either original conversation finishes on its own; finish cannot interrupt it.",
             "tell_the_peer": ("Leave the other conversation one final mailbox note (no wake) so it also stops: " + ", ".join(other[:3])) if other else None,
-            "to_resume": "Nothing has to be paired again: duet_native_start allows wakeups again, and setting a schedule does that by itself."}
+            "to_resume": ("Paused, not ended: duet_native_start resumes the wakeups and the paused schedule together."
+                          if park else
+                          "Nothing has to be paired again: duet_native_start allows wakeups again, and setting a schedule does that by itself.")}
 
 def dispatch(operation, args):
     if operation.startswith('autopilot_'):
@@ -1537,9 +1661,13 @@ def dispatch(operation, args):
         return schedule.operate(operation, args)
     if operation == "finish":
         return finish(args)
+    if operation == "guide":
+        return guide()
     if operation == "doctor":
         if args.get("login"):
             return open_login(args["login"])
+        if flag(args, "upgrade"):
+            return self_upgrade()
         if flag(args, "fix"):
             return doctor_fix()
         return doctor()
@@ -1554,6 +1682,24 @@ def dispatch(operation, args):
                 result["waited"] = True
                 return result
             time.sleep(2)
+    if operation == "join":
+        # The health check talks to both CLIs and can take seconds, so it runs after the pairing is
+        # committed and the database is released: a slow or hung CLI never locks the mailbox.
+        check = args.get("check") is not False
+        root, state, db = connect(args["root"])
+        try:
+            with db:
+                result = operate("join", {k: v for k, v in args.items() if k != "check"}, root, state, db)
+        finally:
+            db.close()
+        if check:
+            signed_out = [p for p in ("codex", "claude") if logged_in(p) is False]  # one probe per CLI
+            if signed_out:
+                result["needs_user"] = [signed_out_message(p) for p in signed_out]
+                result["then"] = "Call duet_doctor login=<provider> to open the sign-in window for them, or duet_doctor fix=true for a full check."
+            if models_check_due():
+                result["models_check_due"] = "Call duet_doctor fix=true (or duet_models refresh=true) before the first consultation."
+        return result
     wake = False
     if operation == "send" and args.get("wake") is not None:
         wake = flag(args, "wake")
@@ -1628,10 +1774,16 @@ def operate(op, a, root, state, db):
             except ValueError as exc:
                 bound = {"bound": None, "error": str(exc)}
         note = {}
+        partner = "claude" if provider == "codex" else "codex"
+        if not db.execute("SELECT 1 FROM peers WHERE provider=?", (partner,)).fetchone():
+            # The one manual step of pairing, ready to copy: the other conversation has not joined yet.
+            note["paste_into_the_other_conversation"] = "用 agent-duet 配對這個專案：%s。目標：%s" % (root, project["goal"])
+            note["waiting_for"] = "the %s conversation; give the user the sentence above to paste there, and keep working meanwhile" % (
+                "Claude Code" if partner == "claude" else "Codex")
         if earlier:
-            note = {"same_conversation_also_joined_as": earlier,
-                    "note": "This conversation already has a name here. Its mailbox follows the conversation, so messages sent to the "
-                            "earlier names still reach you; reuse one name from now on."}
+            note["same_conversation_also_joined_as"] = earlier
+            note["note"] = ("This conversation already has a name here. Its mailbox follows the conversation, so messages sent to the "
+                            "earlier names still reach you; reuse one name from now on.")
         return {"joined": name, "root": str(root), "project": dict(project), "native_binding": bound, **note,
                 "git": keep_out_of_git(root),
                 "goal_matches": a["goal"] == project["goal"],
@@ -1703,9 +1855,16 @@ def operate(op, a, root, state, db):
         dedupe = a.get("dedupe") or str(uuid.uuid4())
         existing = db.execute("SELECT * FROM messages WHERE sender=? AND dedupe=?", (a["sender"], dedupe)).fetchone()
         if existing:
-            if existing["recipient"] != a["recipient"] or existing["body"] != body:
+            # The stored text may carry the version footer this bridge appended; nothing else may differ.
+            stored = existing["body"]
+            same_text = stored == body or (existing["kind"] == "result" and GIT_FOOTER.sub("", stored, count=1) == body
+                                           and GIT_FOOTER.search(stored) is not None)
+            if existing["recipient"] != a["recipient"] or not same_text:
                 raise ValueError("dedupe key reused for a different message")
             return {"message_id": existing["id"], "duplicate": True}
+        version = git_context(root) if kind == "result" and a.get("git") is not False else None
+        if version and len(body) + len(version) + 2 <= 50000:
+            body = body + "\n\n" + version  # the reviewer sees exactly which commit and files this is about
         reply = a.get("reply_to")
         if reply is not None:
             original = db.execute("SELECT * FROM messages WHERE id=?", (reply,)).fetchone()
@@ -1716,6 +1875,8 @@ def operate(op, a, root, state, db):
         cur = db.execute("INSERT INTO messages(sender,recipient,kind,body,reply_to,dedupe,created) VALUES(?,?,?,?,?,?,?)",
                          (a["sender"], a["recipient"], kind, body, reply, dedupe, now))
         result = {"message_id": cur.lastrowid, "delivered_to": "durable mailbox", "gui_woken": False}
+        if version:
+            result["code_version"] = version
         if reply is not None and kind in ("result", "decision", "done"):
             # A reply that reports the outcome closes the original. "Got it, tomorrow" (kind=message)
             # does not: the task must stay in the inbox until it is actually handled.
@@ -1876,13 +2037,14 @@ DEFS = {
     "schedule_next": ("Adaptive schedule: after your check-in, say who checks next and in how many minutes (10-720), with the reason. Sooner while things move or are fragile, later while a long run is simply in progress. Works on any schedule to move the next check once.", {"root": ROOT, "name": S, "who": {"enum": ["claude", "codex"]}, "minutes": {"type": "number"}, "reason": S}, ["root", "name", "minutes"]),
     "schedule_status": ("Show the check-in schedule: cycle, who checks next and when, recent check-ins. With no schedule it lists the presets.", {"root": ROOT}, ["root"]),
     "finish": ("The project is done: stop everything that could keep running or spending in the background (check-in schedule, wakeups, running consultations, background runs, file claims), save an optional final checkpoint, and report what was stopped. pause_only=true parks the project instead (wakeups paused, can be resumed). Mail and history are kept.", {"root": ROOT, "name": S, "summary": S, "next_steps": S, "evidence": S, "pause_only": {"type": "boolean"}}, ["root", "name"]),
-    "doctor": ("Check local prerequisites without invoking models: CLI versions, whether each CLI is signed in, what is ready, and the fix for every problem. fix=true is the one call to start a collaboration with: it also resolves the two model tiers, updates an outdated CLI when the user allowed that, opens the sign-in for a signed-out CLI, and returns fixed / needs_user / still_to_do_by_agent. login=claude|codex opens that CLI's own sign-in in a terminal window for the user to finish in their browser.", {"login": {"enum": ["claude", "codex"]}, "fix": {"type": "boolean"}}, []),
+    "doctor": ("Check local prerequisites without invoking models: CLI versions, whether each CLI is signed in, what is ready, and the fix for every problem. fix=true is the one call to start a collaboration with: it also resolves the two model tiers, updates an outdated CLI when the user allowed that, opens the sign-in for a signed-out CLI, and returns fixed / needs_user / still_to_do_by_agent. login=claude|codex opens that CLI's own sign-in in a terminal window for the user to finish in their browser. upgrade=true fetches and installs the newest Agent Duet (only when the user asks, for example 更新 agent-duet).", {"login": {"enum": ["claude", "codex"]}, "fix": {"type": "boolean"}, "upgrade": {"type": "boolean"}}, []),
+    "guide": ("What the user can say to drive Agent Duet: every situation with an example phrase and what you do for it, plus the current defaults. Call it when the user asks what Agent Duet can do or how to use it, and show the result as a short table in their language.", {}, []),
     "models": ("Resolve the two model tiers right now (standard=newest everyday model, hard=newest flagship) and report anything out of date, with the exact fix. Call once at the start of a collaboration, when the user says a model was released, or when a result says models_check_due. refresh=true also compares the installed CLIs with the newest published versions. update=true updates an outdated CLI itself, in the background, and reports the before/after versions. auto_update=true|false stores whether outdated CLIs are updated without asking from then on (on refresh, and before a consultation that would otherwise run on an old model). families={provider:{tier:family}} records a renamed family after you confirmed it on the vendor's model page.", {"refresh": {"type": "boolean"}, "update": {"type": "boolean"}, "auto_update": {"type": "boolean"}, "families": {"type": "object"}}, []),
-    "join": ("Pair this actual session with a SPECIFIC project root and goal. Choose unique names per session and reuse your name when you come back. Pass session (your real session UUID) so the pairing survives restarts; Claude also passes address (its exact ListAgents self address) and title to bind for native wakeups in the same call, Codex is bound automatically.", {"root": ROOT, "project_name": S, "goal": S, "name": S, "provider": {"enum": ["codex", "claude"]}, "session": S, "address": S, "title": S}, ["root", "project_name", "goal", "name", "provider"]),
+    "join": ("Pair this actual session with a SPECIFIC project root and goal. Choose unique names per session and reuse your name when you come back. Pass session (your real session UUID) so the pairing survives restarts; Claude also passes address (its exact ListAgents self address) and title to bind for native wakeups in the same call, Codex is bound automatically. The result includes the exact sentence for the user to paste into the other conversation when it has not joined yet, and needs_user when a CLI is signed out.", {"root": ROOT, "project_name": S, "goal": S, "name": S, "provider": {"enum": ["codex", "claude"]}, "session": S, "address": S, "title": S, "check": {"type": "boolean"}}, ["root", "project_name", "goal", "name", "provider"]),
     "status": ("Where the collaboration stands, in one call: overview (mail waiting per participant and how long, pairing state and wake usage, running jobs, what needs attention), participants, claims, recent jobs and the latest checkpoint. Use it to answer the user's 'progress?' question. Recent does not prove the GUI is awake.", {"root": ROOT}, ["root"]),
     "checkpoint": ("Save a concise durable handoff for resuming tomorrow: outcome, evidence, remaining work.", {"root": ROOT, "name": S, "summary": S, "next_steps": S, "evidence": S}, ["root", "name", "summary"]),
     "set_goal": ("Update this project's agreed goal after notifying/reconciling with peers; compare-and-set prevents stale overwrites.", {"root": ROOT, "name": S, "goal": S, "expected_goal": S}, ["root", "name", "goal", "expected_goal"]),
-    "send": ("Queue a task, critique, reply or cancellation to an existing peer. A reply (reply_to) of kind result, decision or done closes the message it answers; any other kind leaves it open. wake=true also wakes the peer's original conversation in the same call; use it only when the peer is stopped and must act now, never for an update or a change log.", {"root": ROOT, "sender": S, "recipient": S, "body": S, "kind": S, "reply_to": I, "dedupe": S, "wake": {"type": "boolean"}}, ["root", "sender", "recipient", "body"]),
+    "send": ("Queue a task, critique, reply or cancellation to an existing peer. A reply (reply_to) of kind result, decision or done closes the message it answers; any other kind leaves it open. wake=true also wakes the peer's original conversation in the same call; use it only when the peer is stopped and must act now, never for an update or a change log. A message of kind result gets one line naming the git branch, commit and uncommitted files, so a review is bound to that version (git=false leaves it out).", {"root": ROOT, "sender": S, "recipient": S, "body": S, "kind": S, "reply_to": I, "dedupe": S, "wake": {"type": "boolean"}, "git": {"type": "boolean"}}, ["root", "sender", "recipient", "body"]),
     "inbox": ("Read unacknowledged messages for this conversation (including mail addressed to its earlier names); call at work checkpoints. Reading marks them as read for the sender. Also returns awaiting_peer: your own handoffs the peer has not handled yet, with age, wake state and read_by_peer (the peer's conversation fetched it). peek=true reads without marking anything as read.", {"root": ROOT, "name": S, "limit": I, "peek": {"type": "boolean"}}, ["root", "name"]),
     "ack": ("Acknowledge messages you have handled. A reply of kind result, decision or done already closes its original. Reading alone never consumes a message.", {"root": ROOT, "name": S, "ids": {"type": "array", "items": I}}, ["root", "name", "ids"]),
     "claim": ("Acquire/renew an exact-key cooperative edit lease; coordinate scopes first.", {"root": ROOT, "name": S, "resource": S, "lease_seconds": I}, ["root", "name", "resource"]),

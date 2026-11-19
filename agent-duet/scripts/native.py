@@ -262,7 +262,10 @@ def operate(d, op, a, root, state, db, project):
             check_limits(cap,hours,budget)
             db.execute("UPDATE native_run SET state='active',max_wakes=?,window=?,courier_budget=?,deadline=?,first_peer=?,second_peer=?",
                        (cap,hours*3600,budget,now+FOREVER,*names))
+            db.commit()
+            import schedule
             return {'run_id':old['id'],'state':'active','attached':True,'resumed':old['state']!='active',
+                    'schedule_resumed':schedule.resume(root,db,now),
                     'max_wakes':cap,'max_hours':round(hours,3),'courier_budget_usd':budget,
                     'limits':'max_wakes and the courier budget apply per rolling max_hours window; the pairing itself does not expire.'}
         cap=int(a.get('max_wakes',40)); hours=float(a.get('max_hours',8)); budget=float(a.get('courier_budget_usd',2.0))
@@ -291,6 +294,15 @@ def operate(d, op, a, root, state, db, project):
     msg=db.execute('SELECT * FROM messages WHERE id=?',(a['message_id'],)).fetchone()
     if not msg or (msg['sender']!=a['name'] and not (system and msg['sender']=='scheduler')):
         raise ValueError('Wake only a message you sent')
+    if system:
+        # A scheduled wake is only valid while its schedule is. Checked here, in the transaction that
+        # reserves the transport call, so a project that was finished a moment ago is never woken.
+        import schedule
+        plan=schedule.load(db)
+        if not plan or plan.get('state')!='active' or (a.get('_schedule_id') and plan.get('id')!=a['_schedule_id']):
+            db.execute('UPDATE messages SET ack=? WHERE id=? AND ack IS NULL',(now,msg['id']))
+            db.commit()
+            return {'status':'not_sent','sent':False,'processed_by_recipient':False,'error':'the schedule was stopped before this check-in went out'}
     if a.get('run_id') and (not run or a['run_id']!=run['id']):
         raise ValueError('That run ID is not the current pairing; omit run_id to use the current one')
     if msg['ack']: return {'status':'already_acknowledged'}

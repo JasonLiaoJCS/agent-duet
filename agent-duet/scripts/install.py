@@ -114,17 +114,31 @@ def set_codex_tool_timeout(config, seconds=600):
     os.replace(tmp, config)
     return "set to %d s" % seconds
 
+OFFICIAL = "jasonliaojcs/agent-duet"
+
 def upgrade_source(source):
-    """Fast-forward a git checkout of the skill before installing from it."""
+    """Fast-forward a git checkout of the skill before installing from it. The installer that runs
+    next is whatever this leaves on disk, so it only proceeds from the official repository and from
+    an unmodified tree."""
     repo = source.parent
     git = shutil.which("git")
     if not git or not (repo/".git").exists():
         raise SystemExit("--upgrade needs a git checkout of Agent Duet, and this copy is not one. Nothing was changed.\n"
                          "Download the new version from https://github.com/JasonLiaoJCS/agent-duet and run its installer.")
-    done = subprocess.run([git, "-C", str(repo), "pull", "--ff-only"], capture_output=True, text=True,
-                          encoding="utf-8", errors="replace", timeout=180, creationflags=FLAGS)
+    def run(*args):
+        return subprocess.run([git, "-C", str(repo), *args], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=180, creationflags=FLAGS)
+    origin = run("remote", "get-url", "origin")
+    if origin.returncode or OFFICIAL not in origin.stdout.strip().lower().replace("\\", "/"):
+        raise SystemExit("--upgrade only fetches from the official repository, and this checkout's origin is %s. Nothing was changed.\n"
+                         "Update it yourself with git, then run the installer without --upgrade." % (origin.stdout.strip() or "not set"))
+    dirty = run("status", "--porcelain", "--untracked-files=no")
+    if dirty.returncode or dirty.stdout.strip():
+        raise SystemExit("This checkout has local changes, so --upgrade stopped before fetching. Nothing was changed.\n"
+                         "Commit or discard them (git status shows them), or run the installer without --upgrade to install this copy as it is.")
+    done = run("pull", "--ff-only")
     if done.returncode:
-        raise SystemExit("Could not update the checkout:\n" + (done.stderr or done.stdout).strip())
+        raise SystemExit("Could not update the checkout. Nothing was installed.\n" + (done.stderr or done.stdout).strip())
     return (done.stdout or "").strip().splitlines()[-1] if (done.stdout or "").strip() else "up to date"
 
 def offer_login(result, args):
@@ -142,6 +156,78 @@ def offer_login(result, args):
         if answer in ("", "y", "yes"):
             subprocess.run(duet.login_command(provider))
             print("%s CLI: %s" % (provider, "signed in" if duet.logged_in(provider) else "still signed out; run the command again later"))
+
+def ours(text):
+    """Is this registration the Agent Duet bridge (and not something else that happens to share the name)?"""
+    return "duet.py" in str(text).replace("\\", "/").lower()
+
+def uninstall(args, custom_claude_home):
+    """Take Agent Duet off this computer. Nothing is deleted: skill folders are moved to a backup,
+    and a registration named agent-duet is removed only if it really points at this bridge."""
+    removed, kept = [], []
+    codex, _ = optional_cli("codex")
+    claude, _ = optional_cli("claude")
+    if codex:
+        env = dict(os.environ, CODEX_HOME=str(args.codex_home))
+        shown = subprocess.run(codex + ["mcp", "get", "agent-duet"], capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", timeout=30, creationflags=FLAGS, env=env)
+        if shown.returncode == 0 and ours(shown.stdout):
+            if subprocess.run(codex + ["mcp", "remove", "agent-duet"], capture_output=True, timeout=30, creationflags=FLAGS, env=env).returncode == 0:
+                removed.append("Codex tool registration")
+        elif shown.returncode == 0:
+            kept.append("Codex has a tool named agent-duet that is not this bridge; it was left alone")
+    if claude:
+        env = dict(os.environ)
+        if custom_claude_home is not None:
+            env["CLAUDE_CONFIG_DIR"] = str(custom_claude_home)
+        shown = subprocess.run(claude + ["mcp", "get", "agent-duet"], capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", timeout=30, creationflags=FLAGS, env=env)
+        if shown.returncode == 0 and ours(shown.stdout):
+            if subprocess.run(claude + ["mcp", "remove", "--scope", "user", "agent-duet"], capture_output=True, timeout=30,
+                              creationflags=FLAGS, env=env).returncode == 0:
+                removed.append("Claude Code tool registration")
+        elif shown.returncode == 0:
+            kept.append("Claude Code has a tool named agent-duet that is not this bridge; it was left alone")
+    if os.name == "nt":
+        desktop = Path(os.environ.get("APPDATA", str(Path.home()/"AppData/Roaming")))/"Claude/claude_desktop_config.json"
+    elif sys.platform == "darwin":
+        desktop = Path.home()/"Library/Application Support/Claude/claude_desktop_config.json"
+    else:
+        desktop = Path.home()/".config/Claude/claude_desktop_config.json"
+    desktop = getattr(args, "desktop_config", None) or desktop
+    if not args.skip_desktop and desktop.is_file():
+        try:
+            config = json.loads(desktop.read_text(encoding="utf-8-sig"))
+            entry = config.get("mcpServers", {}).get("agent-duet") if isinstance(config.get("mcpServers"), dict) else None
+            if entry is not None and ours(json.dumps(entry)):
+                backup(desktop)
+                del config["mcpServers"]["agent-duet"]
+                tmp = desktop.with_name(desktop.name + ".agent-duet-tmp")
+                tmp.write_text(json.dumps(config, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")
+                os.replace(tmp, desktop)
+                removed.append("Claude Desktop tool registration")
+            elif entry is not None:
+                kept.append("Claude Desktop has a tool named agent-duet that is not this bridge; it was left alone")
+        except (OSError, ValueError) as exc:
+            kept.append("Claude Desktop config was left alone (%s)" % exc)
+    for home in (args.codex_home, args.claude_home):
+        folder = home/"skills/agent-duet"
+        marker = folder/"SKILL.md"
+        if marker.is_file() and "name: agent-duet" in marker.read_text(encoding="utf-8", errors="replace"):
+            backups = home/"agent-duet-backups"
+            backups.mkdir(parents=True, exist_ok=True)
+            target = backups/("uninstalled-" + time.strftime("%Y%m%d-%H%M%S") + "-" + str(time.time_ns() % 1000000))
+            folder.rename(target)
+            removed.append("skill folder %s (moved to %s)" % (folder, target))
+    kept.append("Project mailboxes (.agent-duet/ inside each project) and ~/.agent-duet/models.json were not touched; delete them yourself if you want.")
+    return {"removed": removed, "kept": kept}
+
+def uninstall_summary(result):
+    lines = ["", "Agent Duet was removed from this computer." if result["removed"] else "Agent Duet was not installed here.", ""]
+    lines += ["  removed: " + item for item in result["removed"]]
+    lines += ["  kept:    " + item for item in result["kept"]]
+    lines += ["", "Reopen Codex and Claude Code so they drop the tools. To install again, run the installer.", ""]
+    return chr(10).join(lines)
 
 def summary(result, missing):
     """What a person needs to know after installing, in plain words."""
@@ -193,6 +279,9 @@ def main():
                         help="Fetch the newest version first (git pull in this checkout), then install it.")
     parser.add_argument("--json", action="store_true", help="Print the full result as JSON instead of a summary.")
     parser.add_argument("--no-login-prompt", action="store_true", help="Do not offer to sign in a signed-out CLI at the end.")
+    parser.add_argument("--uninstall", action="store_true",
+                        help="Remove Agent Duet from this computer: its tool registrations and skill folders (kept as a backup). "
+                             "Project mailboxes are left alone.")
     args = parser.parse_args()
     if sys.version_info < (3, 10):
         raise SystemExit("Agent Duet needs Python 3.10+ (3.11+ recommended).")
@@ -204,6 +293,10 @@ def main():
         raise SystemExit(subprocess.run([sys.executable, "-X", "utf8", str(Path(__file__).resolve())] + forwarded, env=env).returncode)
     custom_claude_home = args.claude_home
     args.claude_home = args.claude_home or Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home()/".claude")))
+    if args.uninstall:
+        print(json.dumps(uninstall(args, custom_claude_home), ensure_ascii=False, indent=2) if args.json
+              else uninstall_summary(uninstall(args, custom_claude_home)))
+        return
     source = Path(__file__).resolve().parents[1]
     codex_dest, claude_dest = args.codex_home/"skills/agent-duet", args.claude_home/"skills/agent-duet"
     # Resolve prerequisites before modifying anything. One CLI is enough to install; both are needed for pairing.
@@ -223,6 +316,10 @@ def main():
     previous = read_settings(codex_dest, claude_dest)
     mode = args.default_mode or previous.get("default_mode") or "review"
     settings = dict(previous, default_mode=mode)
+    if (source.parent / ".git").exists():
+        settings["source_checkout"] = str(source)  # lets "update Agent Duet" fetch and reinstall by itself
+    elif not Path(str(previous.get("source_checkout") or "")).is_dir():
+        settings.pop("source_checkout", None)
     result = {"skills": [], "backups": [], "default_consult_mode": mode}
     for dest in (codex_dest, claude_dest):
         copy_skill(source, dest)

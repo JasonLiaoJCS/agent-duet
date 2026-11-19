@@ -48,7 +48,7 @@ One roundtrip in each direction, then stop; never exchange acknowledgments of ac
 - Every handoff is a durable `duet_send`. Add `duet_native_wake` only when the peer is stopped and waiting, or silent for over 30 minutes while you are blocked on it. Never wake a peer that is still working, and never wake to deliver an FYI or a change log. Each wake queues one full turn in the peer's original conversation; eight wakes in twenty minutes once left a slow high-tier Codex conversation answering stale notices long after it had read the messages.
 - Agree in the handshake that a wake for an already handled message ends the receiver's turn at once, without a reply.
 - Before going idle with unfinished work, leave the other side a concrete next action, evidence and clear ownership. Nothing wakes either agent if both finish without a handoff.
-- Completion needs the other side's independent review against the acceptance criteria. Then send the final result, save a checkpoint and call `duet_native_stop(state="completed")`. User stop → `paused`; essential human input → `needs_user`. Stop prevents further wakes; it does not kill a turn that is already running.
+- Completion needs the other side's independent review against the acceptance criteria. Then send the final result and call `duet_finish` with a one-line summary: it stops the wakeups, any schedule, running consultations and background runs, and saves the final checkpoint. A break is `duet_finish pause_only=true`; `duet_native_start` resumes it. `duet_native_stop` only stops the wakeups (use `state=needs_user` when work waits on an essential human decision). None of these can interrupt a turn that is already running.
 
 ## After a restart
 
