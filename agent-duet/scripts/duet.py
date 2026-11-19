@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 
-VERSION = "2.4.0"
+VERSION = "2.4.1"
 TERMINAL = {"completed", "failed", "cancelled", "timed_out", "interrupted"}
 FLAGS = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
@@ -471,29 +471,37 @@ def choose_codex(models, tier, effort, family=None):
 STALE_HINT = ("The installed Codex CLI lists this model as an older generation, so a newer one exists that this CLI "
               "cannot see. Update it (npm install -g @openai/codex@latest) and rerun duet_models.")
 
+def cli_check(state, provider):
+    """The stored lookup record, whatever shape an older version left behind."""
+    info = (state.get("cli_checked") if isinstance(state.get("cli_checked"), dict) else {}).get(provider)
+    return dict(info) if isinstance(info, dict) else {}
+
 def newer_cli_published(provider):
     """With the standing permission only: is a newer CLI published than the one installed?
     The registry is asked at most once a day (once an hour after a failed lookup). A newer version
     that could not be installed yet stays pending and is tried again by the next consultation."""
     def due(state):
-        info = (state.get("cli_checked") or {}).get(provider) or {}
+        info = cli_check(state, provider)
         wait = 86400 if info.get("ok", True) else 3600
         return time.time() - float(info.get("at") or 0) > wait
+    def store(state, info):
+        if not isinstance(state.get("cli_checked"), dict):
+            state["cli_checked"] = {}
+        state["cli_checked"][provider] = info
     if due(models_state()):
         claimed = []
         def claim(state):  # decided under the lock, so concurrent consultations do one lookup
             if due(state):
-                info = dict((state.get("cli_checked") or {}).get(provider) or {})
+                info = cli_check(state, provider)
                 info.update(at=time.time(), ok=False)
-                state.setdefault("cli_checked", {})[provider] = info
+                store(state, info)
                 claimed.append(True)
         change_models_state(claim)
         if claimed:
             latest = latest_published(NPM_PACKAGES[provider])
             if latest:
-                change_models_state(lambda state: state.setdefault("cli_checked", {}).__setitem__(
-                    provider, {"at": time.time(), "ok": True, "latest": latest}))
-    latest = parse_version(((models_state().get("cli_checked") or {}).get(provider) or {}).get("latest"))
+                change_models_state(lambda state: store(state, {"at": time.time(), "ok": True, "latest": latest}))
+    latest = parse_version(cli_check(models_state(), provider).get("latest"))
     if not latest:
         return False
     have = parse_version(installed_version(provider))
@@ -551,6 +559,72 @@ def installed_version(provider):
         return (done.stdout or done.stderr).strip()
     except Exception as exc:
         return "unavailable: " + str(exc)
+
+LOGIN_FIX = {"claude": "Open a terminal, run `claude auth login` and finish the sign-in in the browser.",
+             "codex": "Open a terminal, run `codex login` and finish the sign-in in the browser."}
+
+def logged_in(provider):
+    """True / False / None (could not tell). The desktop apps keep their own login, so a CLI can be
+    signed out while the app works; then every wake and every consultation through it fails."""
+    if os.environ.get("AGENT_DUET_ASSUME_LOGIN") == "1":
+        return True  # for the test-suite, whose stand-in CLIs cannot be asked
+    try:
+        command = cli(provider) + (["auth", "status"] if provider == "claude" else ["login", "status"])
+        done = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              timeout=20, creationflags=FLAGS, stdin=subprocess.DEVNULL)
+    except Exception:
+        return None
+    text = ((done.stdout or "") + (done.stderr or "")).strip()
+    if provider == "claude":
+        try:
+            return bool(json.loads(done.stdout).get("loggedIn"))
+        except (ValueError, AttributeError):
+            pass
+    lowered = text.lower()
+    if "not logged in" in lowered or "logged out" in lowered:
+        return False
+    if "logged in" in lowered:
+        return True
+    return None if not text else (done.returncode == 0)
+
+def login_command(provider):
+    return cli(provider) + (["auth", "login"] if provider == "claude" else ["login"])
+
+def open_login(provider):
+    """Open the CLI's own sign-in in a visible terminal window. The person signs in themselves in the
+    browser it opens; nothing is typed for them and no credential passes through this bridge."""
+    if provider not in ("claude", "codex"):
+        raise ValueError("login must be claude or codex")
+    if logged_in(provider) is True:
+        return {"provider": provider, "opened": False, "already_signed_in": True}
+    command = login_command(provider)
+    shown = "claude auth login" if provider == "claude" else "codex login"
+    try:
+        if os.name == "nt":
+            subprocess.Popen(["cmd", "/c", "start", "Agent Duet sign-in", "cmd", "/k"] + command, stdin=subprocess.DEVNULL)
+        elif sys.platform == "darwin":
+            import shlex
+            script = 'tell application "Terminal" to do script %s' % json.dumps(shlex.join(command))
+            subprocess.Popen(["osascript", "-e", script, "-e", 'tell application "Terminal" to activate'], stdin=subprocess.DEVNULL)
+        else:
+            import shlex
+            terminals = (("x-terminal-emulator", ["-e"]), ("gnome-terminal", ["--"]), ("konsole", ["-e"]), ("xfce4-terminal", ["-x"]), ("xterm", ["-e"]))
+            found = next(((shutil.which(name), flag) for name, flag in terminals if shutil.which(name)), None)
+            if not found:
+                return {"provider": provider, "opened": False, "run_this": shown,
+                        "note": "No terminal emulator was found to open; run the command in any terminal."}
+            subprocess.Popen([found[0]] + found[1] + command, stdin=subprocess.DEVNULL, start_new_session=True)
+    except Exception as exc:
+        return {"provider": provider, "opened": False, "run_this": shown, "error": str(exc)}
+    return {"provider": provider, "opened": True, "run_this": shown,
+            "tell_the_user": "A terminal window opened for the %s sign-in. Finish it in the browser, then close that window; "
+                             "nothing else needs to be set up again." % provider}
+
+def login_problem(provider):
+    """A sentence for the user when this CLI is definitely signed out, else None."""
+    if logged_in(provider) is False:
+        return f"The {provider} CLI on this computer is signed out (the desktop app keeps a separate login). " + LOGIN_FIX[provider]
+    return None
 
 def cli_in_use(provider):
     """Best effort: is an npm-installed CLI of this provider running right now (for example a bridge job)?"""
@@ -951,7 +1025,7 @@ def run_worker(root, job_id):
             if not success:
                 result["error"] = str(parsed.get("result") or "Claude CLI reported an error")[:2000]
                 if "authenticate" in result["error"].lower() or "oauth" in result["error"].lower():
-                    result["hint"] = "The Claude CLI login expired. Run `claude` once in a terminal and log in, then retry this job."
+                    result["hint"] = "The Claude CLI is signed out. " + LOGIN_FIX["claude"] + " Then retry this job."
             family = routing.get("family") or families()["claude"][job["tier"]]
             remember_observed(family, list(parsed.get("modelUsage", {})))
             result["model_mismatch"] = bool(result["actual_models"]) and not any(
@@ -977,7 +1051,7 @@ def run_worker(root, job_id):
                     success = False
                     result["error"] = event
                     if "auth" in encode(event).lower() or "login" in encode(event).lower():
-                        result["hint"] = "The Codex CLI may need a fresh login. Run `codex login`, then retry this job."
+                        result["hint"] = "The Codex CLI may be signed out. " + LOGIN_FIX["codex"] + " Then retry this job."
         if not result.get("answer"):
             success = False
         job_update(db, job_id, "completed" if success else "failed", result)
@@ -1017,11 +1091,14 @@ def doctor():
                 info["queue"] = queue_help.returncode == 0
                 if not info["queue"]:
                     result["problems"].append("This Codex CLI has no `queue` command; update Codex (npm i -g @openai/codex) for native wakeups.")
+            info["logged_in"] = logged_in(provider)
+            if info["logged_in"] is False:
+                result["problems"].append(login_problem(provider))
             result["providers"][provider] = info
         except Exception as exc:
             result["providers"][provider] = {"error": str(exc)}
             result["problems"].append(f"{provider}: {exc}")
-    working = [p for p, info in result["providers"].items() if "error" not in info]
+    working = [p for p, info in result["providers"].items() if "error" not in info and info.get("logged_in") is not False]
     result["ready"] = {"mailbox_and_checkpoints": True,
                        "consult_codex": "codex" in working, "consult_claude": "claude" in working,
                        "native_pairing": len(working) == 2 and not any("older" in p or "queue" in p for p in result["problems"])}
@@ -1045,6 +1122,8 @@ def dispatch(operation, args):
         import autopilot
         return autopilot.operate(operation,args)
     if operation == "doctor":
+        if args.get("login"):
+            return open_login(args["login"])
         return doctor()
     if operation == "models":
         return models_report(args)
@@ -1255,6 +1334,9 @@ def operate(op, a, root, state, db):
             raise ValueError("mode must be work or review")
         if provider not in ("codex", "claude") or tier not in ("standard", "hard") or effort not in ("medium", "high", "xhigh", "max"):
             raise ValueError("Invalid provider, tier, or effort")
+        signed_out = login_problem(provider)
+        if signed_out:
+            raise ValueError(signed_out + " Then start this consultation again.")
         reason = a.get("reason", "")
         if (tier == "hard" or effort in ("xhigh", "max")) and not reason.strip():
             raise ValueError("Escalation needs a concrete reason")
@@ -1346,7 +1428,7 @@ DEFS = {
     "autopilot_stop": ("Stop this autonomous run and cancel its current worker; keep its handoff history.",{"root":ROOT,"run_id":S},["root","run_id"]),
     "autopilot_resume": ("Resume an interrupted or unfinished autonomous run after addressing its blocker. Never resumes completed work.",{"root":ROOT,"run_id":S,"additional_turns":I,"max_hours":{"type":"number"},"instructions":S},["root","run_id"]),
     "watch": ("Bind this MCP connection to your project mailbox for Claude Code channel notifications. Requires session channel opt-in; delivery is NOT proven until you reply/ack.",{"root":ROOT,"name":S},["root","name"]),
-    "doctor": ("Check local prerequisites without invoking models.", {}, []),
+    "doctor": ("Check local prerequisites without invoking models: CLI versions, whether each CLI is signed in, what is ready, and the fix for every problem. login=claude|codex opens that CLI's own sign-in in a terminal window for the user to finish in their browser; use it when a CLI is signed out.", {"login": {"enum": ["claude", "codex"]}}, []),
     "models": ("Resolve the two model tiers right now (standard=newest everyday model, hard=newest flagship) and report anything out of date, with the exact fix. Call once at the start of a collaboration, when the user says a model was released, or when a result says models_check_due. refresh=true also compares the installed CLIs with the newest published versions. update=true updates an outdated CLI itself, in the background, and reports the before/after versions. auto_update=true|false stores whether outdated CLIs are updated without asking from then on (on refresh, and before a consultation that would otherwise run on an old model). families={provider:{tier:family}} records a renamed family after you confirmed it on the vendor's model page.", {"refresh": {"type": "boolean"}, "update": {"type": "boolean"}, "auto_update": {"type": "boolean"}, "families": {"type": "object"}}, []),
     "join": ("Pair this actual session with a SPECIFIC project root and goal. Choose unique names per session and reuse your name when you come back. Pass session (your real session UUID) so the pairing survives restarts; Claude also passes address (its exact ListAgents self address) and title to bind for native wakeups in the same call, Codex is bound automatically.", {"root": ROOT, "project_name": S, "goal": S, "name": S, "provider": {"enum": ["codex", "claude"]}, "session": S, "address": S, "title": S}, ["root", "project_name", "goal", "name", "provider"]),
     "status": ("Inspect joined peers, cooperative claims and recent jobs. Recent does not prove the GUI is awake.", {"root": ROOT}, ["root"]),

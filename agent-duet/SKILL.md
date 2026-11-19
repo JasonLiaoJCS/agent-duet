@@ -77,6 +77,12 @@ Nothing has to be paired again. The project ID, the participant names, the mailb
 
 A wake that returns `limit_reached` hit the rate limit for the current window; the pairing is still active and the message is safe in the mailbox. Do not start anything new: let the peer read it at its next work boundary, or raise `max_wakes` with `duet_native_start` if the task really needs more. Check that no leftover helper process from before the restart (screen capture, viewers, monitors, test runs) is still running.
 
+### When the user is needed: a signed-out CLI
+
+Signing a CLI in is the one step this skill cannot do for the user. The desktop apps keep their own login, so the `claude` or `codex` CLI can be signed out while the app works perfectly; every wake and consultation through that CLI then fails, which looks like the pairing "keeps disconnecting". Run `duet_doctor` once at the start of a collaboration so this is found before work depends on it. `duet_native_wake`, `duet_consult` and `duet_native_status check=true` also report it, without spending anything.
+
+When a CLI is signed out: call `duet_doctor login=<provider>`. It opens that CLI's own sign-in in a terminal window. Tell the user in one line that a window opened and that they only need to finish the sign-in in their browser. Never ask for, type or handle credentials yourself. When they say it is done, repeat the wake or consultation that was refused. Nothing has to be paired again.
+
 ### After the skill is upgraded
 
 Nothing has to be taught or paired again. Every project keeps its ID, mailbox, checkpoints and pairing in its own `.agent-duet/` folder, and older state is migrated in place the first time the new version touches it. From 2.4 on, a conversation that is already open hands its calls to the newly installed bridge by itself and is told to fetch the new tool definitions; a conversation still running 2.3 or earlier needs its MCP tools reloaded once, and so does any conversation where a tool still looks old. Re-read this skill when you next use it, because the rules may have changed: `duet_doctor` shows the installed version.

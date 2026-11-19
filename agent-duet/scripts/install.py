@@ -127,17 +127,41 @@ def upgrade_source(source):
         raise SystemExit("Could not update the checkout:\n" + (done.stderr or done.stdout).strip())
     return (done.stdout or "").strip().splitlines()[-1] if (done.stdout or "").strip() else "up to date"
 
+def offer_login(result, args):
+    """In an interactive terminal, sign a signed-out CLI in right away instead of leaving it for later."""
+    if args.json or args.no_login_prompt or not (sys.stdin and sys.stdin.isatty() and sys.stdout.isatty()):
+        return
+    import duet
+    for provider, state in result.get("signed_in", {}).items():
+        if state is not False:
+            continue
+        try:
+            answer = input("Sign the %s CLI in now? A browser window will open. [Y/n] " % provider).strip().lower()
+        except EOFError:
+            return
+        if answer in ("", "y", "yes"):
+            subprocess.run(duet.login_command(provider))
+            print("%s CLI: %s" % (provider, "signed in" if duet.logged_in(provider) else "still signed out; run the command again later"))
+
 def summary(result, missing):
     """What a person needs to know after installing, in plain words."""
     lines = ["", "Agent Duet %s is installed." % result["version"], ""]
     lines.append("  Codex          : " + ("tools registered" if result["codex_mcp"] and not str(result["codex_mcp"]).startswith("skipped") else "not found on this computer"))
     lines.append("  Claude Code    : " + ("tools registered" if result["claude_mcp"] and not str(result["claude_mcp"]).startswith("skipped") else "not found on this computer"))
     lines.append("  Claude Desktop : " + ("tools registered" if str(result["claude_desktop"]).startswith("registered") else "not present"))
+    for provider, label in (("codex", "Codex CLI sign-in  "), ("claude", "Claude CLI sign-in ")):
+        state = result.get("signed_in", {}).get(provider)
+        if state is not None or provider not in missing:
+            lines.append("  %s: %s" % (label, "ok" if state else "SIGNED OUT" if state is False else "could not check"))
     lines.append("  Consult workers default to: " + ("read-only (review)" if result["default_consult_mode"] == "review" else "full permissions (work)"))
     lines.append("  Update outdated CLIs automatically: " + ("yes" if result["auto_update_cli"] else "no (enable with --auto-update on)"))
     if result.get("upgrade"):
         lines.append("  Source: " + result["upgrade"])
     lines += ["", "Next:"]
+    signed_out = [p for p, state in result.get("signed_in", {}).items() if state is False]
+    for provider in signed_out:
+        lines.append("  * Sign the %s CLI in: run `%s` and finish in the browser." % (provider, "claude auth login" if provider == "claude" else "codex login"))
+        lines.append("    (The desktop app has its own login; this one is separate, and waking or reviewing needs it.)")
     if missing:
         lines.append("  1. Install and log in to %s, then run this installer again to enable pairing." % " and ".join(missing))
     else:
@@ -164,6 +188,7 @@ def main():
     parser.add_argument("--upgrade", action="store_true",
                         help="Fetch the newest version first (git pull in this checkout), then install it.")
     parser.add_argument("--json", action="store_true", help="Print the full result as JSON instead of a summary.")
+    parser.add_argument("--no-login-prompt", action="store_true", help="Do not offer to sign in a signed-out CLI at the end.")
     args = parser.parse_args()
     if sys.version_info < (3, 10):
         raise SystemExit("Agent Duet needs Python 3.10+ (3.11+ recommended).")
@@ -247,9 +272,11 @@ def main():
                       if not missing else
                       "Installed for the available client. Install and log in to %s, then rerun this installer to enable native pairing." % " and ".join(missing))
     result["version"] = _duet.VERSION
+    result["signed_in"] = {name: _duet.logged_in(name) for name, found in (("codex", codex), ("claude", claude)) if found}
     if os.environ.get("AGENT_DUET_UPGRADE_NOTE"):
         result["upgrade"] = os.environ["AGENT_DUET_UPGRADE_NOTE"]
     print(json.dumps(result, ensure_ascii=False, indent=2) if args.json else summary(result, missing))
+    offer_login(result, args)
 
 if __name__ == "__main__":
     main()

@@ -93,7 +93,7 @@ class DuetTests(unittest.TestCase):
             duet.valid_workdir(self.root,str(other))
         child=self.root/'child'
         child.mkdir()
-        self.assertEqual(duet.valid_workdir(self.root,str(child)),child)
+        self.assertEqual(duet.valid_workdir(self.root,str(child)),child.resolve())
     def test_file_snapshot_preserves_unicode_and_rejects_escape(self):
         (self.root/'sample.txt').write_text('正確\n$(literal)',encoding='utf-8')
         context=duet.file_context(self.root,self.root,['sample.txt'])

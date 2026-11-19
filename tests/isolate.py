@@ -14,4 +14,6 @@ for _name in ('codex', 'claude'):
     _double = os.path.join(_home, _name + '-test-double')
     open(_double, 'w').close()
     os.environ['AGENT_DUET_%s_BIN' % _name.upper()] = _double
+# The stand-ins cannot answer "are you signed in?"; tests about sign-in patch duet.logged_in.
+os.environ['AGENT_DUET_ASSUME_LOGIN'] = '1'
 atexit.register(shutil.rmtree, _home, ignore_errors=True)

@@ -159,7 +159,8 @@ class HotUpgradeTests(unittest.TestCase):
                 self.assertEqual(json.loads(before['result']['content'][0]['text'])['version'], duet.VERSION)
                 source = (scripts / 'duet.py').read_text(encoding='utf-8')
                 upgraded = source.replace('VERSION = "%s"' % duet.VERSION, 'VERSION = "99.0.0"')
-                upgraded = upgraded.replace('"doctor": ("Check local prerequisites without invoking models."', '"doctor": ("NEW DESCRIPTION"')
+                import re
+                upgraded = re.sub(r'"doctor": \("[^"]*"', '"doctor": ("NEW DESCRIPTION"', upgraded, count=1)
                 self.assertNotEqual(source, upgraded)
                 (scripts / 'duet.py').write_text(upgraded, encoding='utf-8')
                 after, notices = ask(3, 'tools/call', {'name': 'duet_doctor', 'arguments': {}})
@@ -177,6 +178,18 @@ class HotUpgradeTests(unittest.TestCase):
 
 
 class InstallerTests(unittest.TestCase):
+    def test_without_tomllib_the_config_is_left_alone_and_the_user_is_told(self):
+        with tempfile.TemporaryDirectory() as folder:
+            config = Path(folder) / 'config.toml'
+            original = '[mcp_servers.agent-duet]\ncommand = "python"\n'
+            config.write_text(original, encoding='utf-8')
+            with patch.dict(sys.modules, {'tomllib': None}):   # what Python 3.10 looks like
+                message = install.set_codex_tool_timeout(config)
+            self.assertIn('not changed', message)
+            self.assertIn('tool_timeout_sec = 600', message)
+            self.assertEqual(config.read_text(encoding='utf-8'), original)
+
+    @unittest.skipIf(sys.version_info < (3, 11), 'tomllib is needed to edit config.toml')
     def test_codex_tool_timeout_is_added_once_and_only_to_this_server(self):
         with tempfile.TemporaryDirectory() as folder:
             config = Path(folder) / 'config.toml'
@@ -194,6 +207,7 @@ class InstallerTests(unittest.TestCase):
             self.assertNotIn('tool_timeout_sec', data['mcp_servers']['other'])
             self.assertEqual(data['tail'], {'key': 1})
 
+    @unittest.skipIf(sys.version_info < (3, 11), 'tomllib is needed to edit config.toml')
     def test_missing_entry_leaves_the_file_alone(self):
         with tempfile.TemporaryDirectory() as folder:
             config = Path(folder) / 'config.toml'

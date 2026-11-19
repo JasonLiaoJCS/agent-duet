@@ -77,11 +77,16 @@ def reachability(d, root, db):
                 continue
             try:
                 out[b['name']] = {'reachable': True, 'title': live_claude_title(d, root, stable)}
+                problem = d.login_problem('claude')
+                if problem:
+                    out[b['name']] = {'reachable': False, 'detail': problem, 'fix': 'The user signs the CLI in once; no re-pairing is needed.'}
             except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
                 out[b['name']] = {'reachable': False, 'detail': str(exc),
                                   'fix': 'Open that Claude Code conversation in this project (it needs a unique name); no re-pairing is needed.'}
         else:
-            out[b['name']] = {'reachable': None, 'detail': 'Codex accepts queued messages for a thread; it runs them when the thread is open in the app.'}
+            problem = d.login_problem('codex')
+            out[b['name']] = ({'reachable': False, 'detail': problem, 'fix': 'The user signs the CLI in once; no re-pairing is needed.'} if problem else
+                              {'reachable': None, 'detail': 'Codex accepts queued messages for a thread; it runs them when the thread is open in the app.'})
     return out
 
 
@@ -346,6 +351,11 @@ def operate(d, op, a, root, state, db, project):
         db.commit()
         return {'status':'not_sent','sent':False,'error':str(exc),'processed_by_recipient':False,
                 'fix':'Install and log in to the %s CLI on this machine (duet_doctor shows what is missing); the message is safe in the mailbox.' % binding['provider']}
+    signed_out=d.login_problem(binding['provider'])
+    if signed_out:
+        db.commit()
+        return {'status':'not_sent','sent':False,'error':signed_out,'needs_user':True,'processed_by_recipient':False,
+                'fix':'Tell the user this one step. The message is safe in the mailbox and this wake can be repeated afterwards.'}
     db.execute('INSERT INTO native_attempts VALUES(?,?,?,?,?)',(run['id'],msg['id'],'sending',now,json.dumps(reservation)))
     db.commit()  # Claim before external effect; a crash is ambiguous, never automatically resend.
     text=notice(project,root,msg)
