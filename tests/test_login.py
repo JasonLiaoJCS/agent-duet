@@ -155,8 +155,9 @@ class PromptTests(unittest.TestCase):
         with patch.object(duet, 'cli', side_effect=lambda provider: [provider]), patch.object(duet, 'logged_in', return_value=False), \
              patch.object(duet.subprocess, 'Popen') as start, patch.object(duet.shutil, 'which', return_value='/usr/bin/xterm'):
             result = duet.dispatch('doctor', {'login': 'codex'})
-        launched = [str(part) for part in start.call_args.args[0]]
-        self.assertEqual(launched[-2:], ['codex', 'login'])
+        launched = ' '.join(str(part) for part in start.call_args.args[0])   # a list on Windows/Linux, an AppleScript on macOS
+        self.assertIn('codex login', launched)
+        self.assertNotIn('auth', launched)
         self.assertEqual(result['run_this'], 'codex login')
 
     def test_notification_failure_is_harmless(self):
