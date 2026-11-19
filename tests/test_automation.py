@@ -220,7 +220,8 @@ class InstallerTests(unittest.TestCase):
                   'default_consult_mode': 'review', 'auto_update_cli': False}
         text = install.summary(result, ['claude'])
         self.assertIn('Agent Duet 2.4.0 is installed', text)
-        self.assertIn('Install and log in to claude', text)
+        self.assertIn('Install the missing CLI', text)
+        self.assertIn('claude auth login', text)
         self.assertIn('nothing has to be set up again', text)
         self.assertNotIn('{', text)
 

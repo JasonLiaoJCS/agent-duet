@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 
-VERSION = "2.5.0"
+VERSION = "2.6.0"
 TERMINAL = {"completed", "failed", "cancelled", "timed_out", "interrupted"}
 FLAGS = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
@@ -194,6 +194,24 @@ def stable_session(session):
         return str(uuid.UUID(session or ""))
     except (ValueError, AttributeError, TypeError):
         return None
+
+def keep_out_of_git(root):
+    """The mailbox can hold project content and must not end up in a commit. Add it to this clone's
+    private exclude list (.git/info/exclude), which changes no tracked file and nobody else's setup."""
+    try:
+        info = root / ".git" / "info"
+        if not (root / ".git").is_dir():
+            return "not a git repository"
+        info.mkdir(exist_ok=True)
+        exclude = info / "exclude"
+        text = exclude.read_text(encoding="utf-8", errors="replace") if exclude.exists() else ""
+        if any(line.strip() in (".agent-duet/", ".agent-duet", "/.agent-duet/", "/.agent-duet") for line in text.splitlines()):
+            return "already excluded"
+        with open(exclude, "a", encoding="utf-8", newline="\n") as handle:
+            handle.write(("" if not text or text.endswith("\n") else "\n") + ".agent-duet/\n")
+        return "added to .git/info/exclude"
+    except OSError as exc:
+        return "could not update .git/info/exclude: %s" % exc
 
 def own_names(db, name):
     """Every participant name of the same real conversation. A conversation that came back under a
@@ -1292,6 +1310,7 @@ def operate(op, a, root, state, db):
                     "note": "This conversation already has a name here. Its mailbox follows the conversation, so messages sent to the "
                             "earlier names still reach you; reuse one name from now on."}
         return {"joined": name, "root": str(root), "project": dict(project), "native_binding": bound, **note,
+                "git": keep_out_of_git(root),
                 "goal_matches": a["goal"] == project["goal"],
                 "name_matches": a["project_name"] == project["name"],
                 "instruction": "Compare the registered goal with this task; explicitly reconcile differences with the peer before work.",
@@ -1302,7 +1321,24 @@ def operate(op, a, root, state, db):
         autoruns=[]
         if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='autoruns'").fetchone():
             autoruns=[dict(r) for r in db.execute('SELECT id,state,updated FROM autoruns ORDER BY updated DESC LIMIT 10')]
-        return {"root": str(root), "project": dict(project) if project else None,
+        unhandled = {}
+        for r in db.execute("SELECT recipient,COUNT(*) AS n,MIN(created) AS oldest,SUM(seen IS NULL) AS unread FROM messages WHERE ack IS NULL GROUP BY recipient"):
+            unhandled[r["recipient"]] = {"waiting": r["n"], "not_yet_read": r["unread"] or 0,
+                                         "oldest_minutes": round((now - r["oldest"]) / 60)}
+        pairing = None
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='native_run'").fetchone():
+            run = db.execute("SELECT * FROM native_run").fetchone()
+            if run:
+                window = run["window"] if "window" in run.keys() else 28800
+                used = db.execute("SELECT COUNT(*) FROM native_attempts WHERE run_id=? AND updated>=?", (run["id"], now - window)).fetchone()[0]
+                pairing = {"state": run["state"], "between": [run["first_peer"], run["second_peer"]],
+                           "wakes_used": used, "max_wakes": run["max_wakes"], "window_hours": round(window / 3600, 2)}
+        running = [dict(r) for r in db.execute("SELECT id,provider,tier,status FROM jobs WHERE status NOT IN ('completed','failed','cancelled','timed_out','interrupted')")]
+        stuck = [name for name, info in unhandled.items() if info["oldest_minutes"] > 240]
+        overview = {"mail_waiting": unhandled, "pairing": pairing, "jobs_running": running,
+                    "attention": (["Mail for %s has waited over four hours; if that conversation is stopped, wake it once, or check that it is open and its CLI is signed in." % n for n in stuck]
+                                  + ([] if pairing else ["No wake pairing yet: both conversations join with their session UUID, then the first wake creates it."]))}
+        return {"root": str(root), "project": dict(project) if project else None, "overview": overview,
                 "autonomous_runs":autoruns,
                 "peers": [dict(r) | {"recent": now-r["seen"] < 180} for r in db.execute("SELECT * FROM peers")],
                 "claims": [dict(r) for r in db.execute("SELECT * FROM claims WHERE expires>?", (now,))],
@@ -1516,7 +1552,7 @@ DEFS = {
     "doctor": ("Check local prerequisites without invoking models: CLI versions, whether each CLI is signed in, what is ready, and the fix for every problem. fix=true is the one call to start a collaboration with: it also resolves the two model tiers, updates an outdated CLI when the user allowed that, opens the sign-in for a signed-out CLI, and returns fixed / needs_user / still_to_do_by_agent. login=claude|codex opens that CLI's own sign-in in a terminal window for the user to finish in their browser.", {"login": {"enum": ["claude", "codex"]}, "fix": {"type": "boolean"}}, []),
     "models": ("Resolve the two model tiers right now (standard=newest everyday model, hard=newest flagship) and report anything out of date, with the exact fix. Call once at the start of a collaboration, when the user says a model was released, or when a result says models_check_due. refresh=true also compares the installed CLIs with the newest published versions. update=true updates an outdated CLI itself, in the background, and reports the before/after versions. auto_update=true|false stores whether outdated CLIs are updated without asking from then on (on refresh, and before a consultation that would otherwise run on an old model). families={provider:{tier:family}} records a renamed family after you confirmed it on the vendor's model page.", {"refresh": {"type": "boolean"}, "update": {"type": "boolean"}, "auto_update": {"type": "boolean"}, "families": {"type": "object"}}, []),
     "join": ("Pair this actual session with a SPECIFIC project root and goal. Choose unique names per session and reuse your name when you come back. Pass session (your real session UUID) so the pairing survives restarts; Claude also passes address (its exact ListAgents self address) and title to bind for native wakeups in the same call, Codex is bound automatically.", {"root": ROOT, "project_name": S, "goal": S, "name": S, "provider": {"enum": ["codex", "claude"]}, "session": S, "address": S, "title": S}, ["root", "project_name", "goal", "name", "provider"]),
-    "status": ("Inspect joined peers, cooperative claims and recent jobs. Recent does not prove the GUI is awake.", {"root": ROOT}, ["root"]),
+    "status": ("Where the collaboration stands, in one call: overview (mail waiting per participant and how long, pairing state and wake usage, running jobs, what needs attention), participants, claims, recent jobs and the latest checkpoint. Use it to answer the user's 'progress?' question. Recent does not prove the GUI is awake.", {"root": ROOT}, ["root"]),
     "checkpoint": ("Save a concise durable handoff for resuming tomorrow: outcome, evidence, remaining work.", {"root": ROOT, "name": S, "summary": S, "next_steps": S, "evidence": S}, ["root", "name", "summary"]),
     "set_goal": ("Update this project's agreed goal after notifying/reconciling with peers; compare-and-set prevents stale overwrites.", {"root": ROOT, "name": S, "goal": S, "expected_goal": S}, ["root", "name", "goal", "expected_goal"]),
     "send": ("Queue a task, critique, reply or cancellation to an existing peer. A reply (reply_to) of kind result, decision or done closes the message it answers; any other kind leaves it open. wake=true also wakes the peer's original conversation in the same call; use it only when the peer is stopped and must act now, never for an update or a change log.", {"root": ROOT, "sender": S, "recipient": S, "body": S, "kind": S, "reply_to": I, "dedupe": S, "wake": {"type": "boolean"}}, ["root", "sender", "recipient", "body"]),

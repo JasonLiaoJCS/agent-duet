@@ -163,7 +163,11 @@ def summary(result, missing):
         lines.append("  * Sign the %s CLI in: run `%s` and finish in the browser." % (provider, "claude auth login" if provider == "claude" else "codex login"))
         lines.append("    (The desktop app has its own login; this one is separate, and waking or reviewing needs it.)")
     if missing:
-        lines.append("  1. Install and log in to %s, then run this installer again to enable pairing." % " and ".join(missing))
+        how = {"codex": "npm install -g @openai/codex   (then: codex login)",
+               "claude": "see https://code.claude.com/docs for the installer   (then: claude auth login)"}
+        lines.append("  1. Install the missing CLI, sign in, and run this installer again to enable pairing:")
+        for name in missing:
+            lines.append("       %s: %s" % (name, how[name]))
     else:
         lines.append("  1. Reopen Codex and Claude Code once so they load the tools.")
         lines.append("     (Conversations already running Agent Duet 2.4 or later switch to the new version by themselves;")

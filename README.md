@@ -57,6 +57,11 @@ sh agent-duet/agent-duet/install.sh --auto-update on
 
 **3. 重新開啟 Codex 和 Claude Code**，讓它們載入新工具。
 
+> **建議的設定**
+> 想要最省事的話，安裝時加上 `--default-mode work --auto-update on`，並且在 Codex 和 Claude Code 裡讓這個專案使用不必每一步都詢問的權限模式。這樣兩邊才能真的自己把事情做完：自己改檔案、跑測試、更新過期的 CLI，而不是每一步都停下來等你按同意。
+>
+> 這等於把專案資料夾裡的操作交給它們，請只在你信任的專案、而且有版本控制可以復原的情況下這樣設定。想保守一點就維持預設值，它一樣能用，只是另外開的 CLI 只能讀不能改，需要你確認的時候會比較多。
+
 **4. 配對**
 
 在同一個專案裡各開一個 Codex 對話和一個 Claude Code 對話，兩邊貼上同一段話：
@@ -79,7 +84,7 @@ sh agent-duet/agent-duet/install.sh --auto-update on
 
 | 情況 | 你說 |
 |---|---|
-| 想知道做到哪了 | 目前進度 |
+| 想知道做到哪了（會一併回報信箱裡還有什麼沒處理、等了多久） | 目前進度 |
 | 想先停一下 | 先暫停 |
 | 隔天、或重開機之後 | 繼續 |
 | 想換方向 | 目標改成…… |
@@ -231,7 +236,7 @@ python agent-duet/agent-duet/scripts/duet.py call doctor --pretty
 
 Agent Duet 本身免費，也不用 API key。它呼叫的是你已經登入的 Codex 和 Claude CLI，用量依各 CLI 的登入方式和計費設定計算。
 
-信箱和進度紀錄存在你的電腦上，放在各專案的 `.agent-duet/` 資料夾，建議加進 `.gitignore`。請另一家審查時，你的提示和選取的檔案會經由那個 CLI 送到該模型的服務，這和你平常使用 Codex、Claude 是一樣的。另外有一個所有專案共用的小檔案 `~/.agent-duet/models.json`，記錄模型的設定。
+信箱和進度紀錄存在你的電腦上，放在各專案的 `.agent-duet/` 資料夾。配對的時候，Agent Duet 會自動把這個資料夾加進那個專案的本機 Git 排除清單（`.git/info/exclude`），所以它不會被 commit，也不會動到你的 `.gitignore`。請另一家審查時，你的提示和選取的檔案會經由那個 CLI 送到該模型的服務，這和你平常使用 Codex、Claude 是一樣的。另外有一個所有專案共用的小檔案 `~/.agent-duet/models.json`，記錄模型的設定。
 
 Agent Duet 自己不開網路連接埠，也不安裝排程或開機啟動的服務。它自己會連出去的只有一件事：向 npm 查 CLI 的最新版本號。
 

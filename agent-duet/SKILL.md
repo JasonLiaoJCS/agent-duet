@@ -15,6 +15,7 @@ The user set this up so they would not have to operate it. When something is wro
 - **Yours to handle without asking:** an outdated CLI or model, a changed address after a restart, old project state, an upgraded skill, a wake that hit a rate limit or a cooldown, a failed job that can simply be retried once, a peer that misread the request, re-judging which model family is the flagship.
 - **Only the user can:** finish a sign-in in the browser, open a conversation that is closed, choose the model their own app conversation runs on, and decide scope, priorities or anything outward-facing. Ask for these in one short line that says exactly what to do, and keep working on everything that does not depend on it.
 - **Never fail quietly.** If a step could not be done, say so, say what you already tried, and say the one thing that would unblock it.
+- **Answer "progress?" from one call.** `duet_status.overview` shows the mail waiting on each side and for how long, the pairing state and wake usage, running jobs, and an `attention` list. Act on `attention` yourself before reporting.
 
 ## Useful, fast cooperation at reasonable cost
 
