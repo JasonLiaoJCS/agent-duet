@@ -13,7 +13,7 @@ The roles, not the names, are the policy. The flagship is the best model a vendo
 
 ## How resolution works
 
-- **Codex.** Each consultation asks the installed CLI for its live catalog (`codex app-server`: `initialize`, `initialized`, paginated `model/list`) and takes the highest version number of the tier's family among visible models. It fails clearly when the family or the effort is unavailable; there is no silent fallback to a different family.
+- **Codex.** Each consultation asks the installed CLI for its live catalog (`codex app-server`: `initialize`, `initialized`, paginated `model/list`) and takes the highest version number of the tier's family among visible models. When the family is not available to the account it steps down to the next best one and records that in the result (see below); it never does so silently.
 - **Claude.** The CLI is called with the rolling alias, never a fixed model ID, so Claude Code picks the newest member itself. The job result lists the `modelUsage` keys as `actual_models`, and the bridge fails a job whose actual model is from a different family. An inherited `ANTHROPIC_DEFAULT_<ALIAS>_MODEL` override is refused, because it pins the alias to something the user did not choose here.
 - **Families** live in one per-user file, `~/.agent-duet/models.json` (or `$AGENT_DUET_HOME`), shared by the Codex and Claude copies of the skill. With no file the table above applies.
 
@@ -44,6 +44,16 @@ Vendors occasionally rename a line or put a new one on top. The catalog cannot t
 - [Codex app-server and model/list](https://learn.chatgpt.com/docs/app-server)
 - [Claude model aliases and effort](https://code.claude.com/docs/en/model-config)
 - [Claude programmatic CLI](https://code.claude.com/docs/en/headless)
+
+## When the account cannot use a model
+
+Plans differ. A model can be missing from the catalog, refused at run time, or out of quota. The bridge then steps down to the best model the account can use and says so:
+
+- **Codex:** the tier's family, then the everyday family, then any other current family the account can see (newest first). A family that is absent from the catalog is skipped without a call.
+- **Claude:** `fable`, then `opus`, then `sonnet`. Claude has no catalog to consult, so the first refusal costs one short failed call; it is then remembered.
+- A refusal is recognised from the error text (model, plan, access or quota wording). Sign-in errors are a different case and go to the sign-in path. Ordinary task failures are never retried on another model.
+- The refused family is stored under `unavailable` in `~/.agent-duet/models.json` for 24 hours, shown by `duet_models` as `not_available_to_this_account`, and tried again after that.
+- Every job that ran on a stand-in carries `routing.fallback` with `wanted`, `used`, `reason` and a `tell_the_user` sentence.
 
 ## Limits worth knowing
 

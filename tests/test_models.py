@@ -83,8 +83,9 @@ class ModelRoutingTests(unittest.TestCase):
     def test_renamed_family_is_recorded_once_and_used(self):
         renamed = [model('gpt-7-nova'), model('gpt-7-zenith')]
         with patch.object(duet, 'codex_models', return_value=renamed):
-            with self.assertRaisesRegex(RuntimeError, 'nova'):
-                duet.route('codex', 'standard', 'high')
+            before = duet.route('codex', 'standard', 'high')       # work goes on, and the stand-in is declared
+            self.assertEqual(before['fallback']['wanted'], 'sol')
+            self.assertIn(before['model'], ('gpt-7-nova', 'gpt-7-zenith'))
             report = duet.models_report({'families': {'codex': {'standard': 'nova', 'hard': 'zenith'}}})
             self.assertEqual(report['codex']['standard'], 'gpt-7-nova')
             self.assertEqual(duet.route('codex', 'hard', 'high')['model'], 'gpt-7-zenith')

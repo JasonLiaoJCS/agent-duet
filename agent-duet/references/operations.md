@@ -6,6 +6,16 @@ Python 3.10+ and logged-in `codex` / `claude` CLIs are prerequisites; Python 3.1
 
 For Claude Desktop, this installs the MCP tools; a local `.claude/skills` folder is a Claude Code skill location, not a guarantee that ordinary Desktop Chat imports the skill automatically. Upload the distributable skill ZIP in the Desktop skill interface if supported, or attach/paste SKILL.md into the conversation and tell it to use `duet_*` tools. Claude Desktop Code uses its Code environment. If Desktop runs Code in a VM rather than the host, confirm it can access the same root and local MCP endpoint; a host path alone does not connect an isolated VM.
 
+## Background processes and resources
+
+Nothing runs permanently. Three kinds of process exist, each tied to work the user asked for, and `duet_finish` ends all of them for a project:
+
+- **Consultation workers** (`duet_consult`): one Python worker plus one model CLI per job, at most two per project and three at once on the computer (`max_workers` in `settings.json`, or `AGENT_DUET_MAX_WORKERS`, 1 to 8). A job beyond the limit waits for a free slot; a slot held by a process that died is reclaimed.
+- **The schedule timer** (`duet_schedule`): one small Python process per project with an active schedule. It sleeps between checks and uses no model. It exits when the schedule ends, and any later bridge call restarts it if it died while the schedule is still active.
+- **The autopilot supervisor** (`duet_autopilot_start`): one process per run.
+
+The MCP server itself is started by each client and ends with it. No scheduled task, login item or service is installed.
+
 ## CLI fallback
 
 Except connection-bound `watch`, MCP operations have an equivalent command:

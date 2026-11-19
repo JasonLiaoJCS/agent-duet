@@ -272,7 +272,8 @@ def operate(d, op, a, root, state, db, project):
                 'courier_budget_usd':budget,'verified':False,
                 'limits':'max_wakes and the courier budget apply per rolling max_hours window; the pairing itself does not expire.',
                 'budget_scope':'Courier reported API-price estimates only; original chat model usage is not capped by this helper.'}
-    d.peer(db,a['name'])
+    system=a.get('_system') is True   # the schedule timer; not reachable through MCP or the CLI, whose validation rejects it
+    if not system: d.peer(db,a['name'])
     if op=='native_stop':
         run=db.execute('SELECT * FROM native_run').fetchone()
         if not run: raise ValueError('No native pairing to stop')
@@ -288,7 +289,7 @@ def operate(d, op, a, root, state, db, project):
     db.commit(); db.execute('BEGIN IMMEDIATE')
     run=db.execute('SELECT * FROM native_run').fetchone()
     msg=db.execute('SELECT * FROM messages WHERE id=?',(a['message_id'],)).fetchone()
-    if not msg or msg['sender']!=a['name']:
+    if not msg or (msg['sender']!=a['name'] and not (system and msg['sender']=='scheduler')):
         raise ValueError('Wake only a message you sent')
     if a.get('run_id') and (not run or a['run_id']!=run['id']):
         raise ValueError('That run ID is not the current pairing; omit run_id to use the current one')
@@ -296,6 +297,18 @@ def operate(d, op, a, root, state, db, project):
     previous=db.execute('SELECT * FROM native_attempts WHERE message_id=? ORDER BY updated DESC LIMIT 1',(msg['id'],)).fetchone()
     if previous: return {'status':previous['state'],'duplicate':True,'result':compact_result(json.loads(previous['result']))}
     names=[msg['sender'],msg['recipient']]
+    if system:
+        # A scheduled check-in is addressed to one side of the pairing; the pairing is that side and its peer.
+        partner=None
+        if run:
+            partner=next((n for n in (run['first_peer'],run['second_peer']) if d.conversation(db,n)!=d.conversation(db,msg['recipient'])),None)
+        if not partner:
+            provider=db.execute('SELECT provider FROM peers WHERE name=?',(msg['recipient'],)).fetchone()['provider']
+            row=db.execute('SELECT p.name FROM peers p JOIN native_bindings b ON b.name=p.name WHERE p.provider<>? ORDER BY p.seen DESC LIMIT 1',(provider,)).fetchone()
+            partner=row['name'] if row else None
+        if not partner:
+            raise ValueError('The other conversation has not joined and bound itself yet')
+        names=[partner,msg['recipient']]
     # The same two conversations are the same pairing under any of their names: a conversation
     # that rejoined with a new name keeps the limits, the usage and an explicit stop.
     same=bool(run) and {d.conversation(db,run['first_peer']),d.conversation(db,run['second_peer'])}=={d.conversation(db,n) for n in names}

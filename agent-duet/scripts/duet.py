@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 
-VERSION = "2.6.0"
+VERSION = "2.8.0"
 TERMINAL = {"completed", "failed", "cancelled", "timed_out", "interrupted"}
 FLAGS = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
@@ -494,6 +494,103 @@ def cli_check(state, provider):
     info = (state.get("cli_checked") if isinstance(state.get("cli_checked"), dict) else {}).get(provider)
     return dict(info) if isinstance(info, dict) else {}
 
+CLAUDE_LAST_RESORT = "sonnet"
+UNAVAILABLE_FOR = 24 * 3600
+NOT_FOR_THIS_ACCOUNT = re.compile(
+    r"(?:model|plan|subscription|tier|access|entitle\w*|organization|account)[^\n]{0,140}?"
+    r"(?:not (?:available|supported|found|allowed|included|enabled|permitted)|unavailable|no access|not have access|"
+    r"n't have access|upgrade|does not exist|doesn't exist|not exist)"
+    r"|(?:invalid|unknown|unsupported|unrecognized) model|model_not_found|not_found_error"
+    r"|usage limit|rate limit|quota|limit (?:reached|exceeded)|too many requests|\b429\b", re.I)
+
+def not_for_this_account(text):
+    """Does this failure mean "this account cannot use that model right now" (plan, access or quota)?
+    A sign-in problem is something else and is handled by the sign-in path."""
+    text = text or ""
+    if re.search(r"authenticat|oauth|log ?in|sign ?in|api key", text, re.I):
+        return False
+    return bool(NOT_FOR_THIS_ACCOUNT.search(text))
+
+def unavailable_families(provider):
+    marks = (models_state().get("unavailable") or {}).get(provider)
+    marks = marks if isinstance(marks, dict) else {}
+    return {family for family, info in marks.items()
+            if isinstance(info, dict) and time.time() - float(info.get("at") or 0) < UNAVAILABLE_FOR}
+
+def mark_unavailable(provider, family, why):
+    def mutate(state):
+        marks = state.get("unavailable") if isinstance(state.get("unavailable"), dict) else {}
+        own = marks.get(provider) if isinstance(marks.get(provider), dict) else {}
+        own[family] = {"at": time.time(), "why": (why or "")[:300]}
+        marks[provider] = own
+        state["unavailable"] = marks
+    try:
+        change_models_state(mutate)
+    except OSError:
+        pass
+
+def family_chain(provider, tier):
+    """Best first: the tier's own family, then the everyday family, then a last resort."""
+    family = families()[provider]
+    chain = [family[tier]] + ([family["standard"]] if tier == "hard" else [])
+    if provider == "claude":
+        chain.append(CLAUDE_LAST_RESORT)
+    return list(dict.fromkeys(chain))
+
+def fallback_note(wanted, used, reason):
+    return {"wanted": wanted, "used": used, "reason": reason,
+            "tell_the_user": f"The {wanted} model is not available to this account right now, so {used} was used instead."}
+
+def codex_choice(models, tier, effort, skip=()):
+    """(model, family, fallback note or None): the best Codex model this account can use for the tier."""
+    chain = family_chain("codex", tier)
+    wanted = chain[0]
+    blocked = set(skip) | unavailable_families("codex")
+    order = [f for f in chain if f not in blocked]
+    # After the configured families: any other current family the account can see, newest first.
+    others = sorted(((version_of(info["model"]), f) for f, info in catalog_summary(models).items()
+                     if f not in chain and f not in blocked and not info["marked_old"]), reverse=True)
+    for family in order + [f for _, f in others]:
+        selected = pick_codex(models, family)
+        if not selected:
+            continue
+        supported = [e["reasoningEffort"] for e in selected.get("supportedReasoningEfforts", [])]
+        if effort not in supported:
+            if family == wanted and wanted not in blocked:
+                raise ValueError(f"Requested effort {effort} unavailable; supported={supported}")
+            continue
+        note = None if family == wanted else fallback_note(
+            wanted, model_slug(selected), "no %s model is available to this account" % wanted if not pick_codex(models, wanted)
+            else "%s was refused for this account earlier today" % wanted)
+        return model_slug(selected), family, note
+    seen = ", ".join(sorted(catalog_summary(models))) or "none"
+    raise RuntimeError(f"No usable Codex model for this account (families visible: {seen}). Update the Codex CLI or check the "
+                       "account's plan; if a family was renamed, record it with duet_models families=...")
+
+def claude_choice(tier, skip=()):
+    chain = family_chain("claude", tier)
+    blocked = set(skip) | unavailable_families("claude")
+    usable = [f for f in chain if f not in blocked] or [chain[-1]]
+    note = None if usable[0] == chain[0] else fallback_note(chain[0], usable[0], "%s was refused for this account earlier today" % chain[0])
+    return usable[0], note
+
+def next_route(provider, routing, tier, effort, why, cancel_check=None, deadline=None):
+    """After a refusal: the next best model for this account, or None when nothing is left to try."""
+    tried = list(routing.get("tried") or []) + [routing["family"]]
+    wanted = (routing.get("fallback") or {}).get("wanted") or routing["model"]
+    try:
+        if provider == "codex":
+            model, family, _ = codex_choice(codex_models(cancel_check, deadline), tier, effort, skip=tried)
+        else:
+            family, _ = claude_choice(tier, skip=tried)
+            if family in tried:
+                return None
+            model = family
+    except (RuntimeError, ValueError):
+        return None
+    return {"model": model, "family": family, "source": "fallback after a refusal", "tried": tried,
+            "fallback": fallback_note(wanted, model, "the account could not use %s: %s" % (routing["model"], (why or "").strip()[:160]))}
+
 def newer_cli_published(provider):
     """With the standing permission only: is a newer CLI published than the one installed?
     The registry is asked at most once a day (once an hour after a failed lookup). A newer version
@@ -543,18 +640,25 @@ def route(provider, tier, effort, cancel_check=None, deadline=None):
                 remember_update({"codex": updated})
                 if updated.get("updated"):
                     models = codex_models(cancel_check, deadline)
-        result = {"model": choose_codex(models, tier, effort, family), "family": family, "source": "live app-server model/list"}
+        model, family, note = codex_choice(models, tier, effort)
+        result = {"model": model, "family": family, "source": "live app-server model/list"}
+        if note:
+            result["fallback"] = note
         if updated:
             result["cli_update"] = {k: updated.get(k) for k in ("updated", "before", "after", "busy", "error", "manual") if updated.get(k) is not None}
         if is_stale(pick_codex(models, family)):
             result["warning"] = STALE_HINT
         return result
+    family, note = claude_choice(tier)
     pinned = [k for k in ("ANTHROPIC_DEFAULT_" + family.upper() + "_MODEL",)
               if os.environ.get(k)]
     if pinned:
         raise RuntimeError("Alias pinned by " + ", ".join(pinned) + "; review it before claiming latest")
-    return {"model": family, "family": family, "source": "Claude rolling alias; verify result.modelUsage",
-            "caveat": "Provider, CLI version and managed settings can affect alias resolution"}
+    result = {"model": family, "family": family, "source": "Claude rolling alias; verify result.modelUsage",
+              "caveat": "Provider, CLI version and managed settings can affect alias resolution"}
+    if note:
+        result["fallback"] = note
+    return result
 
 def parse_version(text):
     match = re.search(r"(\d+)\.(\d+)\.(\d+)", text or "")
@@ -940,6 +1044,11 @@ def models_report(a):
         report["verify"] = ("Confirm on the vendors' model pages that the standard and hard families above are still the "
                             "everyday and flagship lines; if a family was renamed, call duet_models with families=...")
     report["codex"], report["claude"] = codex, claude
+    blocked = {provider: sorted(unavailable_families(provider)) for provider in ("codex", "claude")}
+    if any(blocked.values()):
+        report["not_available_to_this_account"] = blocked
+        report["fallback_note"] = ("These families were refused for this account in the last 24 hours (plan, access or quota). "
+                                   "The next best available model is used meanwhile, and they are tried again tomorrow.")
     resolved = {"codex": {t: codex.get(t) for t in ("standard", "hard")},
                 "claude": {t: claude[t] for t in ("standard", "hard")}}
     report["checked_at"] = now
@@ -996,6 +1105,47 @@ def job_update(db, job_id, status, result=None):
         db.execute("UPDATE jobs SET status=?,updated=?,result=? WHERE id=?",
                    (status, time.time(), encode(result) if result is not None else None, job_id))
 
+def max_workers():
+    try:
+        return max(1, min(8, int(os.environ.get("AGENT_DUET_MAX_WORKERS") or settings().get("max_workers") or 3)))
+    except (TypeError, ValueError):
+        return 3
+
+class worker_slot:
+    """At most a few model CLIs run at once on this computer, across all projects, so a burst of
+    consultations cannot exhaust memory. A slot held by a process that died is reclaimed."""
+    def __init__(self, give_up):
+        self.give_up, self.path = give_up, None
+    def __enter__(self):
+        folder = user_dir() / "slots"
+        folder.mkdir(parents=True, exist_ok=True)
+        while True:
+            for number in range(max_workers()):
+                path = folder / ("slot-%d" % number)
+                try:
+                    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                    os.write(fd, ("%d %s" % (os.getpid(), process_birth(os.getpid()))).encode())
+                    os.close(fd)
+                    self.path = path
+                    return self
+                except FileExistsError:
+                    try:
+                        pid, _, birth = path.read_text().partition(" ")
+                        if alive_identity(int(pid), birth) is False:
+                            path.unlink()
+                    except (OSError, ValueError):
+                        pass
+                except OSError:
+                    return self  # never block work on bookkeeping
+            self.give_up()  # raises on cancel or timeout
+            time.sleep(2)
+    def __exit__(self, *exc):
+        if self.path is not None:
+            try:
+                self.path.unlink()
+            except OSError:
+                pass
+
 def run_worker(root, job_id):
     root, state, db = connect(root)
     job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -1040,92 +1190,108 @@ def run_worker(root, job_id):
                   "use simpler separate commands or write a small script file and run it. "
                   "Project root: " + str(root) + ". Project ID: " + db.execute("SELECT id FROM project").fetchone()[0] +
                   ". Work directory: " + str(workdir) + ".\n\n" + job["prompt"])
-        args = cli(job["provider"])
-        if job["provider"] == "claude":
-            args += ["-p", "--output-format", "json", "--model", routing["model"],
-                     "--effort", job["effort"], "--no-session-persistence"]
-            if work_mode:
-                args += ["--dangerously-skip-permissions"]
-            else:
-                args += ["--permission-mode", "dontAsk", "--tools", "Read,Grep,Glob", "--restricted",
-                         "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--safe-mode"]
-        else:
-            args += ["exec", "--json", "--ephemeral", "--skip-git-repo-check",
-                     "-C", str(workdir), "-m", routing["model"],
-                     "-c", 'model_reasoning_effort="' + job["effort"] + '"',
-                     "-c", 'approval_policy="never"',
-                     "-c", "features.multi_agent=false",
-                     "-o", str(folder / "answer.txt"), "-"]
-            # Insert options before the stdin prompt marker.
-            args[-1:-1] = ["--dangerously-bypass-approvals-and-sandbox"] if work_mode else ["--ignore-user-config", "-s", "read-only"]
-        env = dict(os.environ, AGENT_DUET_DEPTH="1", PYTHONIOENCODING="utf-8")
-        # Avoid inheriting nesting markers; depth is still enforced by our own entrypoint.
-        env.pop("CLAUDECODE", None)
-        (folder / "input.txt").write_text(prompt, encoding="utf-8")
-        with open(folder / "input.txt", "rb") as inp, open(folder / "stdout.log", "wb") as out, open(folder / "stderr.log", "wb") as err:
-            proc = popen(args, stdin=inp, stdout=out, stderr=err, cwd=workdir, env=env)
-            with db:
-                db.execute("UPDATE jobs SET child_pid=?,child_birth=? WHERE id=?",
-                           (proc.pid, process_birth(proc.pid), job_id))
-            job_update(db, job_id, "running", {"routing": routing, "pid": proc.pid})
-            heartbeat = time.monotonic()
-            while proc.poll() is None:
-                cancel = db.execute("SELECT cancel FROM jobs WHERE id=?", (job_id,)).fetchone()[0]
-                if cancel or time.monotonic() - started > job["timeout"]:
-                    kill_tree(proc)
-                    job_update(db, job_id, "cancelled" if cancel else "timed_out", {"routing": routing})
-                    return
-                if time.monotonic()-heartbeat > 5:
+        def slot_wait():
+            if db.execute("SELECT cancel FROM jobs WHERE id=?", (job_id,)).fetchone()[0]:
+                raise JobCancelled("Cancelled while waiting for a free worker slot")
+            if time.monotonic() - started > job["timeout"]:
+                raise TimeoutError("Timed out waiting for a free worker slot")
+        with worker_slot(slot_wait):
+            while True:
+                args = list(cli(job["provider"]))  # a fresh list for every attempt
+                if job["provider"] == "claude":
+                    args += ["-p", "--output-format", "json", "--model", routing["model"],
+                             "--effort", job["effort"], "--no-session-persistence"]
+                    if work_mode:
+                        args += ["--dangerously-skip-permissions"]
+                    else:
+                        args += ["--permission-mode", "dontAsk", "--tools", "Read,Grep,Glob", "--restricted",
+                                 "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--safe-mode"]
+                else:
+                    args += ["exec", "--json", "--ephemeral", "--skip-git-repo-check",
+                             "-C", str(workdir), "-m", routing["model"],
+                             "-c", 'model_reasoning_effort="' + job["effort"] + '"',
+                             "-c", 'approval_policy="never"',
+                             "-c", "features.multi_agent=false",
+                             "-o", str(folder / "answer.txt"), "-"]
+                    # Insert options before the stdin prompt marker.
+                    args[-1:-1] = ["--dangerously-bypass-approvals-and-sandbox"] if work_mode else ["--ignore-user-config", "-s", "read-only"]
+                env = dict(os.environ, AGENT_DUET_DEPTH="1", PYTHONIOENCODING="utf-8")
+                # Avoid inheriting nesting markers; depth is still enforced by our own entrypoint.
+                env.pop("CLAUDECODE", None)
+                (folder / "input.txt").write_text(prompt, encoding="utf-8")
+                with open(folder / "input.txt", "rb") as inp, open(folder / "stdout.log", "wb") as out, open(folder / "stderr.log", "wb") as err:
+                    proc = popen(args, stdin=inp, stdout=out, stderr=err, cwd=workdir, env=env)
                     with db:
-                        db.execute("UPDATE jobs SET updated=? WHERE id=?", (time.time(), job_id))
+                        db.execute("UPDATE jobs SET child_pid=?,child_birth=? WHERE id=?",
+                                   (proc.pid, process_birth(proc.pid), job_id))
+                    job_update(db, job_id, "running", {"routing": routing, "pid": proc.pid})
                     heartbeat = time.monotonic()
-                time.sleep(.25)
-        raw = (folder / "stdout.log").read_text(encoding="utf-8", errors="replace")
-        error = (folder / "stderr.log").read_text(encoding="utf-8", errors="replace")[-6000:]
-        result = {"routing": routing, "mode": job["mode"], "exit_code": proc.returncode, "stderr_tail": error}
-        success = proc.returncode == 0
-        if job["provider"] == "claude":
-            try:
-                parsed = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                result.update(error=f"Claude returned invalid JSON: {exc}", stdout_tail=raw[-6000:])
-                job_update(db, job_id, "failed", result)
-                return
-            result.update(answer=parsed.get("result", ""), actual_models=list(parsed.get("modelUsage", {})),
-                          usage=parsed.get("usage"), total_cost_usd=parsed.get("total_cost_usd"))
-            success = success and not parsed.get("is_error", False)
-            if not success:
-                result["error"] = str(parsed.get("result") or "Claude CLI reported an error")[:2000]
-                if "authenticate" in result["error"].lower() or "oauth" in result["error"].lower():
-                    result["hint"] = "The Claude CLI is signed out. " + LOGIN_FIX["claude"] + " Then retry this job."
-            family = routing.get("family") or families()["claude"][job["tier"]]
-            remember_observed(family, list(parsed.get("modelUsage", {})))
-            result["model_mismatch"] = bool(result["actual_models"]) and not any(
-                re.search(r"(?:^|[-.])" + family + r"(?:[-.]|$)", m) for m in result["actual_models"])
-            if result["model_mismatch"]:
-                success = False
-                result["error"] = "Actual model did not match requested family; no automatic fallback/retry"
-            result["model_evidence_missing"] = not bool(result["actual_models"])
-            result["provider_result"] = {k: parsed.get(k) for k in ("subtype", "permission_denials")}
-        else:
-            answer = folder / "answer.txt"
-            result["answer"] = answer.read_text(encoding="utf-8") if answer.exists() else ""
-            result["actual_models"] = []  # CLI events may not expose server-resolved model identity.
-            result["tool_access_issue"] = "blocked by policy" in error.lower() or "permission denied" in error.lower()
-            for line in raw.splitlines():
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if event.get("type") == "turn.completed":
-                    result["usage"] = event.get("usage")
-                if event.get("type") in {"error", "turn.failed"}:
+                    while proc.poll() is None:
+                        cancel = db.execute("SELECT cancel FROM jobs WHERE id=?", (job_id,)).fetchone()[0]
+                        if cancel or time.monotonic() - started > job["timeout"]:
+                            kill_tree(proc)
+                            job_update(db, job_id, "cancelled" if cancel else "timed_out", {"routing": routing})
+                            return
+                        if time.monotonic()-heartbeat > 5:
+                            with db:
+                                db.execute("UPDATE jobs SET updated=? WHERE id=?", (time.time(), job_id))
+                            heartbeat = time.monotonic()
+                        time.sleep(.25)
+                raw = (folder / "stdout.log").read_text(encoding="utf-8", errors="replace")
+                error = (folder / "stderr.log").read_text(encoding="utf-8", errors="replace")[-6000:]
+                result = {"routing": routing, "mode": job["mode"], "exit_code": proc.returncode, "stderr_tail": error}
+                success = proc.returncode == 0
+                if job["provider"] == "claude":
+                    try:
+                        parsed = json.loads(raw)
+                    except json.JSONDecodeError as exc:
+                        result.update(error=f"Claude returned invalid JSON: {exc}", stdout_tail=raw[-6000:])
+                        job_update(db, job_id, "failed", result)
+                        return
+                    result.update(answer=parsed.get("result", ""), actual_models=list(parsed.get("modelUsage", {})),
+                                  usage=parsed.get("usage"), total_cost_usd=parsed.get("total_cost_usd"))
+                    success = success and not parsed.get("is_error", False)
+                    if not success:
+                        result["error"] = str(parsed.get("result") or "Claude CLI reported an error")[:2000]
+                        if "authenticate" in result["error"].lower() or "oauth" in result["error"].lower():
+                            result["hint"] = "The Claude CLI is signed out. " + LOGIN_FIX["claude"] + " Then retry this job."
+                    family = routing.get("family") or families()["claude"][job["tier"]]
+                    remember_observed(family, list(parsed.get("modelUsage", {})))
+                    result["model_mismatch"] = bool(result["actual_models"]) and not any(
+                        re.search(r"(?:^|[-.])" + family + r"(?:[-.]|$)", m) for m in result["actual_models"])
+                    if result["model_mismatch"]:
+                        success = False
+                        result["error"] = "Actual model did not match requested family; no automatic fallback/retry"
+                    result["model_evidence_missing"] = not bool(result["actual_models"])
+                    result["provider_result"] = {k: parsed.get(k) for k in ("subtype", "permission_denials")}
+                else:
+                    answer = folder / "answer.txt"
+                    result["answer"] = answer.read_text(encoding="utf-8") if answer.exists() else ""
+                    result["actual_models"] = []  # CLI events may not expose server-resolved model identity.
+                    result["tool_access_issue"] = "blocked by policy" in error.lower() or "permission denied" in error.lower()
+                    for line in raw.splitlines():
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if event.get("type") == "turn.completed":
+                            result["usage"] = event.get("usage")
+                        if event.get("type") in {"error", "turn.failed"}:
+                            success = False
+                            result["error"] = event
+                            if "auth" in encode(event).lower() or "login" in encode(event).lower():
+                                result["hint"] = "The Codex CLI may be signed out. " + LOGIN_FIX["codex"] + " Then retry this job."
+                if not result.get("answer"):
                     success = False
-                    result["error"] = event
-                    if "auth" in encode(event).lower() or "login" in encode(event).lower():
-                        result["hint"] = "The Codex CLI may be signed out. " + LOGIN_FIX["codex"] + " Then retry this job."
-        if not result.get("answer"):
-            success = False
+                # The account may not include the model that was asked for (plan, access or quota).
+                # Use the next best one it can use, once per step down, and say so in the result.
+                refused = "" if success else " ".join(str(v) for v in (result.get("error"), result.get("answer"), result.get("stderr_tail")) if v)
+                step_down = next_route(job["provider"], routing, job["tier"], job["effort"], refused, check_cancel, started + job["timeout"]) \
+                    if (refused and not_for_this_account(refused) and len(routing.get("tried") or []) < 2) else None
+                if not step_down:
+                    break
+                mark_unavailable(job["provider"], routing["family"], refused)
+                routing = step_down
         job_update(db, job_id, "completed" if success else "failed", result)
     except Exception as exc:
         status = "cancelled" if isinstance(exc, JobCancelled) else "timed_out" if isinstance(exc, TimeoutError) else "failed"
@@ -1216,10 +1382,83 @@ def doctor_fix():
                   all_good=not needs_user and not remaining and not [p for p in report["problems"] if "signed out" not in p])
     return report
 
+def finish(a):
+    """The project is done (or parked): stop everything that could keep running or spending in the
+    background, and say what was stopped. Mail, checkpoints and history stay on disk."""
+    import schedule as shifts
+    park = flag(a, "pause_only")
+    root, state, db = connect(a["root"])
+    stopped, still = [], []
+    try:
+        project = db.execute("SELECT * FROM project WHERE singleton=1").fetchone()
+        if not project or a.get("project_id") != project["id"]:
+            raise ValueError("Project ID mismatch; join this exact root first")
+        peer(db, a["name"])
+        now = time.time()
+        plan = shifts.load(db)
+        timer = None
+        if plan and plan.get("state") == "active":
+            timer = (plan.get("pid"), plan.get("birth"))
+            plan.update(state="stopped", ended=now)
+            shifts.save(db, plan)
+            stopped.append("check-in schedule (after %d checks)" % plan.get("checks_done", 0))
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='native_run'").fetchone():
+            run = db.execute("SELECT * FROM native_run").fetchone()
+            target = "paused" if park else "completed"
+            if run and run["state"] in ("active", "limit_reached") or (run and not park and run["state"] in ("paused", "needs_user")):
+                db.execute("UPDATE native_run SET state=?", (target,))
+                stopped.append("wakeups between the two conversations (%s)" % target)
+        for row in db.execute("SELECT id,provider FROM jobs WHERE status NOT IN ('completed','failed','cancelled','timed_out','interrupted')").fetchall():
+            db.execute("UPDATE jobs SET cancel=1 WHERE id=?", (row["id"],))
+            stopped.append("running %s consultation %s" % (row["provider"], row["id"][:8]))
+        released = db.execute("DELETE FROM claims").rowcount
+        if released:
+            stopped.append("%d file claim(s)" % released)
+        supervisors = []
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='autoruns'").fetchone():
+            supervisors = [r["id"] for r in db.execute("SELECT id FROM autoruns WHERE state IN ('queued','running','stopping')")]
+        if a.get("summary"):
+            db.execute("INSERT INTO checkpoints(author,summary,next_steps,evidence,created) VALUES(?,?,?,?,?)",
+                       (a["name"], ("Parked: " if park else "Finished: ") + a["summary"], a.get("next_steps", ""), a.get("evidence", ""), now))
+        other = [r["name"] for r in db.execute("SELECT name FROM peers WHERE name<>? ORDER BY seen DESC", (a["name"],))]
+        db.commit()
+    finally:
+        db.close()
+    for run_id in supervisors:
+        try:
+            import autopilot
+            autopilot.operate("autopilot_stop", {"root": a["root"], "project_id": a["project_id"], "run_id": run_id})
+            stopped.append("background run " + run_id[:8])
+        except Exception as exc:
+            still.append("background run %s could not be stopped: %s" % (run_id[:8], exc))
+    if timer and timer[0]:
+        # The timer notices the stop within a minute; end it now so nothing lingers.
+        if alive_identity(timer[0], timer[1]) is True:
+            try:
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/PID", str(timer[0]), "/T", "/F"], capture_output=True, creationflags=FLAGS, timeout=15)
+                else:
+                    import signal
+                    os.kill(timer[0], signal.SIGTERM)
+            except Exception:
+                pass
+            if alive_identity(timer[0], timer[1]) is True:
+                still.append("the schedule timer (pid %s) is still exiting; it stops by itself within a minute" % timer[0])
+    return {"finished": not park, "parked": park, "stopped": stopped or ["nothing was running"], "still_running": still,
+            "kept": "Mailbox, checkpoints and history stay in .agent-duet/. Nothing of this project runs or spends in the background now."
+                    if not still else "See still_running.",
+            "tell_the_peer": ("Leave the other conversation one final mailbox note (no wake) so it also stops: " + ", ".join(other[:3])) if other else None,
+            "to_resume": "Nothing has to be paired again: duet_native_start allows wakeups again, and setting a schedule does that by itself."}
+
 def dispatch(operation, args):
     if operation.startswith('autopilot_'):
         import autopilot
         return autopilot.operate(operation,args)
+    if operation in ("schedule", "schedule_next", "schedule_status"):
+        import schedule
+        return schedule.operate(operation, args)
+    if operation == "finish":
+        return finish(args)
     if operation == "doctor":
         if args.get("login"):
             return open_login(args["login"])
@@ -1263,6 +1502,12 @@ def dispatch(operation, args):
 
 def operate(op, a, root, state, db):
     now = time.time()
+    if op in ("inbox", "send", "status", "checkpoint"):
+        try:
+            import schedule
+            schedule.ensure_running(root, db)  # a timer lost to a reboot or crash comes back by itself
+        except Exception:
+            pass
     project = db.execute("SELECT * FROM project WHERE singleton=1").fetchone()
     canonical = os.path.normcase(str(root))
     if project and project["root"] != canonical:
@@ -1549,6 +1794,10 @@ DEFS = {
     "autopilot_stop": ("Stop this autonomous run and cancel its current worker; keep its handoff history.",{"root":ROOT,"run_id":S},["root","run_id"]),
     "autopilot_resume": ("Resume an interrupted or unfinished autonomous run after addressing its blocker. Never resumes completed work.",{"root":ROOT,"run_id":S,"additional_turns":I,"max_hours":{"type":"number"},"instructions":S},["root","run_id"]),
     "watch": ("Bind this MCP connection to your project mailbox for Claude Code channel notifications. Requires session channel opt-in; delivery is NOT proven until you reply/ack.",{"root":ROOT,"name":S},["root","name"]),
+    "schedule": ("Set the check-in schedule for a long task: the bridge leaves a check-in in the mailbox and wakes the conversation whose turn it is, so neither side needs a scheduler of its own. It is only the longest the task goes unwatched; either side may still wake the other at any time. mode=fixed with preset alternate (1 h each, taking turns) | codex-heavy (Claude once, Codex twice per 3 h) | claude-heavy | quick (30 min) | relaxed (2 h) | overnight (3 h), optionally interval_minutes to change the step length; mode=custom with pattern like 'claude:60,codex:60,codex:90'; mode=adaptive to decide the next check after every check (duet_schedule_next); mode=off to stop. hours (default 24, max 168) is how long it runs; note says what to watch.", {"root": ROOT, "name": S, "mode": {"enum": ["fixed", "custom", "adaptive", "off"]}, "preset": {"enum": ["alternate", "codex-heavy", "claude-heavy", "quick", "relaxed", "overnight"]}, "pattern": S, "interval_minutes": {"type": "number"}, "first_who": {"enum": ["claude", "codex"]}, "first_minutes": {"type": "number"}, "hours": {"type": "number"}, "max_checks": I, "note": S}, ["root", "name"]),
+    "schedule_next": ("Adaptive schedule: after your check-in, say who checks next and in how many minutes (10-720), with the reason. Sooner while things move or are fragile, later while a long run is simply in progress. Works on any schedule to move the next check once.", {"root": ROOT, "name": S, "who": {"enum": ["claude", "codex"]}, "minutes": {"type": "number"}, "reason": S}, ["root", "name", "minutes"]),
+    "schedule_status": ("Show the check-in schedule: cycle, who checks next and when, recent check-ins. With no schedule it lists the presets.", {"root": ROOT}, ["root"]),
+    "finish": ("The project is done: stop everything that could keep running or spending in the background (check-in schedule, wakeups, running consultations, background runs, file claims), save an optional final checkpoint, and report what was stopped. pause_only=true parks the project instead (wakeups paused, can be resumed). Mail and history are kept.", {"root": ROOT, "name": S, "summary": S, "next_steps": S, "evidence": S, "pause_only": {"type": "boolean"}}, ["root", "name"]),
     "doctor": ("Check local prerequisites without invoking models: CLI versions, whether each CLI is signed in, what is ready, and the fix for every problem. fix=true is the one call to start a collaboration with: it also resolves the two model tiers, updates an outdated CLI when the user allowed that, opens the sign-in for a signed-out CLI, and returns fixed / needs_user / still_to_do_by_agent. login=claude|codex opens that CLI's own sign-in in a terminal window for the user to finish in their browser.", {"login": {"enum": ["claude", "codex"]}, "fix": {"type": "boolean"}}, []),
     "models": ("Resolve the two model tiers right now (standard=newest everyday model, hard=newest flagship) and report anything out of date, with the exact fix. Call once at the start of a collaboration, when the user says a model was released, or when a result says models_check_due. refresh=true also compares the installed CLIs with the newest published versions. update=true updates an outdated CLI itself, in the background, and reports the before/after versions. auto_update=true|false stores whether outdated CLIs are updated without asking from then on (on refresh, and before a consultation that would otherwise run on an old model). families={provider:{tier:family}} records a renamed family after you confirmed it on the vendor's model page.", {"refresh": {"type": "boolean"}, "update": {"type": "boolean"}, "auto_update": {"type": "boolean"}, "families": {"type": "object"}}, []),
     "join": ("Pair this actual session with a SPECIFIC project root and goal. Choose unique names per session and reuse your name when you come back. Pass session (your real session UUID) so the pairing survives restarts; Claude also passes address (its exact ListAgents self address) and title to bind for native wakeups in the same call, Codex is bound automatically.", {"root": ROOT, "project_name": S, "goal": S, "name": S, "provider": {"enum": ["codex", "claude"]}, "session": S, "address": S, "title": S}, ["root", "project_name", "goal", "name", "provider"]),
@@ -1560,7 +1809,7 @@ DEFS = {
     "ack": ("Acknowledge messages you have handled. A reply of kind result, decision or done already closes its original. Reading alone never consumes a message.", {"root": ROOT, "name": S, "ids": {"type": "array", "items": I}}, ["root", "name", "ids"]),
     "claim": ("Acquire/renew an exact-key cooperative edit lease; coordinate scopes first.", {"root": ROOT, "name": S, "resource": S, "lease_seconds": I}, ["root", "name", "resource"]),
     "release": ("Release your cooperative edit lease.", {"root": ROOT, "name": S, "resource": S}, ["root", "name", "resource"]),
-    "consult": ("Start an asynchronous peer CLI. mode=work gives full CLI permissions for the assigned project task; mode=review restricts to read-only. When mode is omitted the installation default from settings.json applies (review unless the owner chose work). tier=standard is the newest everyday model, tier=hard the newest flagship (needs a reason); versions are resolved live, never hard-coded. effort defaults to high; medium is for simple mechanical work, xhigh/max need a reason. Default timeout 1200 s (max 3600). New worker, not existing GUI chat. Explicit files can be included as snapshots.", {"root": ROOT, "requester": S, "provider": {"enum": ["codex", "claude"]}, "prompt": S, "tier": {"enum": ["standard", "hard"]}, "effort": {"enum": ["medium", "high", "xhigh", "max"]}, "mode": {"enum":["work","review"]}, "reason": S, "timeout_seconds": I, "workdir": S, "files": {"type":"array","items":S}, "previous_job_id": S, "role": {"enum": ["general", "reviewer", "planner", "debugger"]}}, ["root", "requester", "provider", "prompt"]),
+    "consult": ("Start an asynchronous peer CLI. mode=work gives full CLI permissions for the assigned project task; mode=review restricts to read-only. When mode is omitted the installation default from settings.json applies (review unless the owner chose work). tier=standard is the newest everyday model, tier=hard the newest flagship (needs a reason); versions are resolved live, never hard-coded. If the account cannot use the requested model (plan, access or quota), the next best one it can use runs instead and routing.fallback says so. effort defaults to high; medium is for simple mechanical work, xhigh/max need a reason. Default timeout 1200 s (max 3600). New worker, not existing GUI chat. Explicit files can be included as snapshots.", {"root": ROOT, "requester": S, "provider": {"enum": ["codex", "claude"]}, "prompt": S, "tier": {"enum": ["standard", "hard"]}, "effort": {"enum": ["medium", "high", "xhigh", "max"]}, "mode": {"enum":["work","review"]}, "reason": S, "timeout_seconds": I, "workdir": S, "files": {"type":"array","items":S}, "previous_job_id": S, "role": {"enum": ["general", "reviewer", "planner", "debugger"]}}, ["root", "requester", "provider", "prompt"]),
     "job": ("Read job status, response, usage and model evidence. wait_seconds (up to 540) blocks until the job finishes, so you do not have to poll. The installer raises Codex's MCP tool timeout for this server to 600 s; on a hand-made setup stay under your client's limit.", {"root": ROOT, "job_id": S, "wait_seconds": I}, ["root", "job_id"]),
     "cancel": ("Cancel only a bridge-owned CLI job; its worker terminates its process tree.", {"root": ROOT, "job_id": S}, ["root", "job_id"]),
 }

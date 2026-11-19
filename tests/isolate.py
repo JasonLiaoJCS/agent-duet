@@ -17,4 +17,5 @@ for _name in ('codex', 'claude'):
 # The stand-ins cannot answer "are you signed in?"; tests about sign-in patch duet.logged_in.
 os.environ['AGENT_DUET_ASSUME_LOGIN'] = '1'
 os.environ['AGENT_DUET_NO_LOGIN_PROMPT'] = '1'  # a test must never open a window or a notification
+os.environ['AGENT_DUET_NO_SCHEDULER'] = '1'     # tests drive the timer by hand; no background process is started
 atexit.register(shutil.rmtree, _home, ignore_errors=True)
