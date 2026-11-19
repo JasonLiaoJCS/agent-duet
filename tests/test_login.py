@@ -85,6 +85,49 @@ class OpenLoginTests(unittest.TestCase):
         self.assertEqual(result['run_this'], 'codex login')
 
 
+class PromptTests(unittest.TestCase):
+    def setUp(self):
+        self.home = tempfile.TemporaryDirectory()
+        env = patch.dict(os.environ, {'AGENT_DUET_HOME': self.home.name, 'AGENT_DUET_NO_LOGIN_PROMPT': '0'})
+        env.start()
+        self.addCleanup(env.stop)
+        self.addCleanup(self.home.cleanup)
+
+    def test_the_user_is_notified_and_the_window_opens_once_not_on_every_failure(self):
+        with patch.object(duet, 'notify_user', return_value=True) as note, \
+             patch.object(duet, 'open_login', return_value={'opened': True}) as window:
+            first = duet.prompt_login('claude')
+            second = duet.prompt_login('claude')
+            other = duet.prompt_login('codex')
+        self.assertTrue(first['prompted'] and first['notification_shown'] and first['sign_in_window_opened'])
+        self.assertIn('finish the sign-in in the browser', first['tell_the_user'])
+        self.assertFalse(second['prompted'])                 # no window storm
+        self.assertTrue(other['prompted'])                   # the other CLI is its own case
+        self.assertEqual((note.call_count, window.call_count), (2, 2))
+
+    def test_a_refused_wake_prompts_the_user_by_itself(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = {'root': folder}
+            r = duet.dispatch('join', base | dict(name='c', provider='codex', session=str(uuid.uuid4()), project_name='P', goal='G'))
+            base['project_id'] = r['project']['id']
+            duet.dispatch('join', base | dict(name='a', provider='claude', session=str(uuid.uuid4()), address='peer [abc123]', title='peer', project_name='P', goal='G'))
+            m = duet.dispatch('send', base | dict(sender='c', recipient='a', body='please review'))['message_id']
+            with patch.object(duet, 'logged_in', side_effect=lambda provider: provider != 'claude'), \
+                 patch.object(duet, 'notify_user', return_value=True) as note, \
+                 patch.object(duet, 'open_login', return_value={'opened': True}) as window, \
+                 patch.object(native, 'relay_claude') as courier:
+                result = duet.dispatch('native_wake', base | dict(name='c', message_id=m))
+            courier.assert_not_called()
+            note.assert_called_once()
+            window.assert_called_once_with('claude')
+            self.assertTrue(result['user_was_prompted'])
+            self.assertIn('sign-in window was opened', result['fix'])
+
+    def test_notification_failure_is_harmless(self):
+        with patch.object(duet.subprocess, 'Popen', side_effect=OSError('no desktop')):
+            self.assertFalse(duet.notify_user('title', 'body'))
+
+
 class InstallerLoginTests(unittest.TestCase):
     def test_summary_points_out_a_signed_out_cli_and_the_command(self):
         import install

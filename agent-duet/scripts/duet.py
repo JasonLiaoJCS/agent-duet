@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 
-VERSION = "2.4.1"
+VERSION = "2.4.2"
 TERMINAL = {"completed", "failed", "cancelled", "timed_out", "interrupted"}
 FLAGS = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
@@ -619,6 +619,60 @@ def open_login(provider):
     return {"provider": provider, "opened": True, "run_this": shown,
             "tell_the_user": "A terminal window opened for the %s sign-in. Finish it in the browser, then close that window; "
                              "nothing else needs to be set up again." % provider}
+
+TOAST = r"""
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
+$t = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+$x = $t.GetElementsByTagName('text')
+$x.Item(0).AppendChild($t.CreateTextNode($env:AGENT_DUET_NOTE_TITLE)) > $null
+$x.Item(1).AppendChild($t.CreateTextNode($env:AGENT_DUET_NOTE_BODY)) > $null
+$app = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($app).Show([Windows.UI.Notifications.ToastNotification]::new($t))
+"""
+
+def notify_user(title, body):
+    """Desktop notification, best effort: the user may not be looking at either conversation."""
+    try:
+        if os.name == "nt":
+            env = dict(os.environ, AGENT_DUET_NOTE_TITLE=title, AGENT_DUET_NOTE_BODY=body)
+            subprocess.Popen(["powershell", "-NoProfile", "-NonInteractive", "-Command", TOAST], env=env, creationflags=FLAGS,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif sys.platform == "darwin":
+            script = "display notification %s with title %s" % (json.dumps(body), json.dumps(title))
+            subprocess.Popen(["osascript", "-e", script], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif shutil.which("notify-send"):
+            subprocess.Popen(["notify-send", title, body], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            return False
+        return True
+    except Exception:
+        return False
+
+def prompt_login(provider, minutes=30):
+    """A signed-out CLI was just found while work depended on it. Do not fail quietly: notify the user
+    and open the sign-in window, at most once per half hour so nothing keeps popping up."""
+    if os.environ.get("AGENT_DUET_NO_LOGIN_PROMPT") == "1":
+        return {"prompted": False}
+    claimed = []
+    def claim(state):
+        seen = state.get("login_prompted") if isinstance(state.get("login_prompted"), dict) else {}
+        if time.time() - float(seen.get(provider) or 0) > minutes * 60:
+            seen[provider] = time.time()
+            state["login_prompted"] = seen
+            claimed.append(True)
+    try:
+        change_models_state(claim)
+    except OSError:
+        return {"prompted": False}
+    if not claimed:
+        return {"prompted": False, "note": "The sign-in window was already opened in the last %d minutes." % minutes}
+    name = "Claude" if provider == "claude" else "Codex"
+    notified = notify_user("Agent Duet: %s needs a sign-in" % name,
+                           "The %s CLI is signed out, so the two AIs cannot reach each other. A sign-in window is open: finish it in your browser." % name)
+    window = open_login(provider)
+    return {"prompted": True, "notification_shown": notified, "sign_in_window_opened": window.get("opened", False),
+            "tell_the_user": "The %s CLI is signed out. A sign-in window was opened and a desktop notification sent; "
+                             "they only need to finish the sign-in in the browser. Then repeat this step." % name}
 
 def login_problem(provider):
     """A sentence for the user when this CLI is definitely signed out, else None."""
@@ -1336,7 +1390,9 @@ def operate(op, a, root, state, db):
             raise ValueError("Invalid provider, tier, or effort")
         signed_out = login_problem(provider)
         if signed_out:
-            raise ValueError(signed_out + " Then start this consultation again.")
+            helped = prompt_login(provider)
+            raise ValueError(signed_out + (" A sign-in window was opened for the user and they were notified." if helped.get("prompted") else "")
+                             + " Tell the user, then start this consultation again once they have signed in.")
         reason = a.get("reason", "")
         if (tier == "hard" or effort in ("xhigh", "max")) and not reason.strip():
             raise ValueError("Escalation needs a concrete reason")

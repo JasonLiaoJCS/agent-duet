@@ -354,8 +354,10 @@ def operate(d, op, a, root, state, db, project):
     signed_out=d.login_problem(binding['provider'])
     if signed_out:
         db.commit()
+        helped=d.prompt_login(binding['provider'])
         return {'status':'not_sent','sent':False,'error':signed_out,'needs_user':True,'processed_by_recipient':False,
-                'fix':'Tell the user this one step. The message is safe in the mailbox and this wake can be repeated afterwards.'}
+                'user_was_prompted':helped.get('prompted',False),
+                'fix':(helped.get('tell_the_user') or 'Tell the user this one step.')+' The message is safe in the mailbox and this wake can be repeated afterwards.'}
     db.execute('INSERT INTO native_attempts VALUES(?,?,?,?,?)',(run['id'],msg['id'],'sending',now,json.dumps(reservation)))
     db.commit()  # Claim before external effect; a crash is ambiguous, never automatically resend.
     text=notice(project,root,msg)
