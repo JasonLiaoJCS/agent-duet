@@ -97,6 +97,27 @@ class Project(unittest.TestCase):
         return result
 
 
+class ArgumentErrorTests(Project):
+    def test_the_error_names_the_wrong_argument_and_the_accepted_ones(self):
+        with self.assertRaises(ValueError) as caught:
+            duet.check_arguments('send', {'root': 'x', 'sender': 'a', 'recipient': 'b', 'boddy': 'typo'})
+        text = str(caught.exception)
+        self.assertIn('unknown: boddy', text)
+        self.assertIn('missing: body', text)
+        self.assertIn('Accepted:', text)
+
+    def test_join_and_status_accept_the_project_id_and_check_it(self):
+        first = self.join('c', 'codex')
+        pid = first['project']['id']
+        again = duet.dispatch('join', dict(root=str(self.root), project_id=pid, name='c', provider='codex',
+                                           session=duet.dispatch('status', {'root': str(self.root)})['peers'][0]['session'],
+                                           project_name='P', goal='Ship the importer'))
+        self.assertEqual(again['project']['id'], pid)
+        duet.check_arguments('status', {'root': 'x', 'project_id': pid})
+        with self.assertRaisesRegex(ValueError, 'belongs to project'):
+            duet.dispatch('status', {'root': str(self.root), 'project_id': 'not-this-one'})
+
+
 class PairingHelpTests(Project):
     def test_first_side_gets_the_exact_sentence_for_the_other_side(self):
         first = self.join('c', 'codex')

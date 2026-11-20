@@ -337,7 +337,7 @@ class HotUpgradeSafetyTests(unittest.TestCase):
                     self.assertNotEqual(done.returncode, 0)
                 self.assertFalse((Path(folder) / '.agent-duet').exists())      # nothing was created
             done = subprocess.run([sys.executable, '-X', 'utf8', str(SCRIPTS / 'duet.py'), 'call', 'status', '--file', '-', '--handoff'],
-                                  input=json.dumps({'root': folder, 'project_id': 'x'}), capture_output=True, text=True, encoding='utf-8')
+                                  input=json.dumps({'root': folder, 'bogus': 'x'}), capture_output=True, text=True, encoding='utf-8')
             self.assertIn('Unknown or missing arguments', json.loads(done.stdout)['error'])
 
 

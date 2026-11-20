@@ -47,6 +47,10 @@ A pairing that says `paused`, `needs_user` or `completed` was stopped on purpose
 - `timed_out`: the default is 20 minutes; give a long job `timeout_seconds` (up to 3600) and a narrower task.
 - Anything else: one retry after fixing the stated cause, never a loop.
 
+## A vendor's account is out of usage
+
+A session, daily or weekly cap ("You've hit your 5-hour limit · resets 11pm") applies to every model of that vendor, so the bridge does not step down a model. The job result carries `account_limit` and a `hint` with the reset time; for the next 30 minutes further consultations and Claude courier wakes for that vendor are refused without a call, and `duet_doctor` lists the vendor as not ready. Tell the user once, in one line, when it resets; meanwhile ask the other vendor (`provider=codex` or `provider=claude`) or leave the work in the mailbox. A wake that was refused this way was never sent and can simply be repeated later. Only the vendor's own error text counts; a task or a reply that merely mentions a limit never triggers this.
+
 ## After the skill is upgraded
 
 Nothing has to be taught or paired again. Every project keeps its ID, mailbox, checkpoints and pairing in its own `.agent-duet/` folder, and older state is migrated in place the first time the new version touches it. From 2.4 on, a conversation that is already open hands its calls to the newly installed bridge by itself and is told to fetch the new tool definitions; a conversation still running an older bridge needs its MCP tools reloaded once, and so does any conversation where a tool still looks old. Re-read SKILL.md when you next use the skill, because the rules may have changed; `duet_doctor` shows the installed version.

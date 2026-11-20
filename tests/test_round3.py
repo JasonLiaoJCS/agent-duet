@@ -130,7 +130,7 @@ class StopStaysStoppedTests(Case):
         started = []
         living = set()
 
-        def launch(root):
+        def launch(root, token=None):
             started.append(root)
             living.add(5000 + len(started))
             return type('P', (), {'pid': 5000 + len(started)})()
@@ -155,7 +155,7 @@ class StopStaysStoppedTests(Case):
     def test_a_timer_that_dies_right_after_starting_is_restarted_by_the_next_call(self):
         launched = []
 
-        def launch(root):
+        def launch(root, token=None):
             launched.append(root)
             return type('P', (), {'pid': 6000 + len(launched)})()
         with patch.dict(os.environ, {'AGENT_DUET_NO_SCHEDULER': '0'}), patch.object(schedule, 'launch', side_effect=launch), \

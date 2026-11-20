@@ -97,12 +97,34 @@ class FinishIsFinalTests(Case):
         self.assertEqual(self.row()['state'], 'stopped')
 
 
+class CheckInReplyTests(Case):
+    def test_answering_a_check_in_with_a_handoff_to_the_peer_closes_it(self):
+        self.call('schedule', name='c', mode='custom', pattern='claude:60')
+        self.idle()
+        root, state, db = duet.connect(str(self.root))
+        try:
+            data = schedule.write(db)
+            entry, message_id = schedule.prepare(root, db, data, time.time() + 3600)
+            schedule.save(db, data)
+            db.commit()
+        finally:
+            db.close()
+        mail = self.call('inbox', name='a')['messages']
+        self.assertEqual([m['sender'] for m in mail], ['scheduler'])
+        reply = self.call('send', sender='a', recipient='c', body='Loss is flat; no action needed.', kind='result', reply_to=message_id)
+        self.assertTrue(reply['acknowledged_original'])
+        self.assertEqual(self.call('inbox', name='a')['messages'], [])
+        self.assertEqual(self.call('inbox', name='c')['messages'][0]['body'].splitlines()[0], 'Loss is flat; no action needed.')
+        with self.assertRaises(ValueError):                              # someone else's check-in cannot be answered
+            self.call('send', sender='c', recipient='a', body='x', reply_to=message_id)
+
+
 class TimerOwnershipTests(Case):
     def test_a_slow_starter_cannot_overwrite_the_timer_another_one_registered(self):
         self.call('schedule', name='a', preset='alternate')
         root, state, db = duet.connect(str(self.root))
         try:
-            def slow_launch(_root):
+            def slow_launch(_root, token=None):
                 # While A is launching, its claim expires and B registers timer 202.
                 other = sqlite3.connect(self.root / '.agent-duet/state.sqlite3')
                 data = json.loads(other.execute('SELECT data FROM schedule').fetchone()[0])

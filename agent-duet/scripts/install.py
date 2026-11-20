@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Install Agent Duet into local Codex/Claude skills and register MCP clients."""
 import argparse
+import re
 import json
 import os
 from pathlib import Path
@@ -115,6 +116,17 @@ def set_codex_tool_timeout(config, seconds=600):
     return "set to %d s" % seconds
 
 OFFICIAL = "jasonliaojcs/agent-duet"
+OFFICIAL_BRANCH = "main"
+
+def is_official(url):
+    """https://github.com/JasonLiaoJCS/agent-duet(.git) or git@github.com:JasonLiaoJCS/agent-duet(.git), exactly."""
+    url = url.strip().lower().replace("\\", "/").rstrip("/")
+    if url.endswith(".git"):
+        url = url[:-4]
+    for prefix in ("https://github.com/", "http://github.com/", "ssh://git@github.com/", "git@github.com:"):
+        if url.startswith(prefix):
+            return url[len(prefix):] == OFFICIAL
+    return False
 
 def upgrade_source(source):
     """Fast-forward a git checkout of the skill before installing from it. The installer that runs
@@ -129,14 +141,14 @@ def upgrade_source(source):
         return subprocess.run([git, "-C", str(repo), *args], capture_output=True, text=True,
                               encoding="utf-8", errors="replace", timeout=180, creationflags=FLAGS)
     origin = run("remote", "get-url", "origin")
-    if origin.returncode or OFFICIAL not in origin.stdout.strip().lower().replace("\\", "/"):
+    if origin.returncode or not is_official(origin.stdout):
         raise SystemExit("--upgrade only fetches from the official repository, and this checkout's origin is %s. Nothing was changed.\n"
                          "Update it yourself with git, then run the installer without --upgrade." % (origin.stdout.strip() or "not set"))
-    dirty = run("status", "--porcelain", "--untracked-files=no")
+    dirty = run("status", "--porcelain", "--untracked-files=normal")   # an untracked file would be installed too
     if dirty.returncode or dirty.stdout.strip():
         raise SystemExit("This checkout has local changes, so --upgrade stopped before fetching. Nothing was changed.\n"
                          "Commit or discard them (git status shows them), or run the installer without --upgrade to install this copy as it is.")
-    done = run("pull", "--ff-only")
+    done = run("pull", "--ff-only", "origin", OFFICIAL_BRANCH)
     if done.returncode:
         raise SystemExit("Could not update the checkout. Nothing was installed.\n" + (done.stderr or done.stdout).strip())
     return (done.stdout or "").strip().splitlines()[-1] if (done.stdout or "").strip() else "up to date"
@@ -158,8 +170,11 @@ def offer_login(result, args):
             print("%s CLI: %s" % (provider, "signed in" if duet.logged_in(provider) else "still signed out; run the command again later"))
 
 def ours(text):
-    """Is this registration the Agent Duet bridge (and not something else that happens to share the name)?"""
-    return "duet.py" in str(text).replace("\\", "/").lower()
+    """Is this registration the Agent Duet bridge (and not something else that happens to share the name)?
+    Ours runs <home>/skills/agent-duet/scripts/duet.py with the argument mcp."""
+    text = str(text).replace("\\\\", "/").replace("\\", "/").lower()
+    # The script path, then (after quotes, commas or brackets) exactly the argument mcp and nothing glued to either.
+    return re.search(r"skills/agent-duet/scripts/duet\.py[\"']?[\s,\]]+[\"']?mcp[\"']?(?=[\s,\]}]|$)", text) is not None
 
 def uninstall(args, custom_claude_home):
     """Take Agent Duet off this computer. Nothing is deleted: skill folders are moved to a backup,

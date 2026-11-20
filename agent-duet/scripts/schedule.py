@@ -59,7 +59,7 @@ def write(db):
 def stop(db, now, state="stopped"):
     """End the active schedule, if any. Returns (data before, timer identity) or (None, None)."""
     data = write(db)
-    if not data or data.get("state") != "active":
+    if not data or data.get("state") not in ("active", "paused") or (state == "paused" and data.get("state") == "paused"):
         return None, None
     timer = (data.get("pid"), data.get("birth"))
     data.update(state=state, ended=now, rev=int(data.get("rev", 0)) + 1)
@@ -124,7 +124,8 @@ def scan(root, patterns):
                     seen.append((path.relative_to(root).as_posix(), info.st_size, info.st_mtime_ns))
                 except (OSError, ValueError):
                     continue
-                if len(seen) >= SCAN_LIMIT:
+                if len(seen) > SCAN_LIMIT:
+                    seen.pop()
                     truncated = True
                     break
             if truncated:
@@ -189,12 +190,13 @@ def alive(data):
     return bool(data.get("pid")) and duet.alive_identity(data["pid"], data.get("birth")) is True
 
 
-def launch(root):
+def launch(root, token=None):
     flags = duet.FLAGS
     if os.name == "nt":
         flags |= subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
-    return subprocess.Popen([sys.executable, "-X", "utf8", str(Path(__file__).resolve()), "run", "--root", str(root)],
+    return subprocess.Popen([sys.executable, "-X", "utf8", str(Path(__file__).resolve()), "run", "--root", str(root)]
+                            + (["--token", token] if token else []),
                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             creationflags=flags, start_new_session=os.name != "nt", env=env)
 
@@ -213,7 +215,7 @@ def start_timer(root, db):
     data.update(claimed_at=now, claim=token)
     save(db, data)
     db.commit()
-    proc = launch(root)
+    proc = launch(root, token)
     current = write(db)
     if current and current.get("id") == data.get("id") and current.get("state") == "active" and current.get("claim") == token:
         # The claim only covers the instant of launching. Once the timer is recorded, a later death
@@ -489,7 +491,7 @@ def fire(root, db, data, now):
     return entry
 
 
-def runner(root):
+def runner(root, token=None):
     me = os.getpid()
     while True:
         root_path, state, db = duet.connect(root)
@@ -505,6 +507,9 @@ def runner(root):
             if data.get("pid") not in (None, me) and alive(data):
                 db.commit()
                 return  # another timer owns this schedule
+            if data.get("pid") is None and data.get("claim") and data.get("claim") != token:
+                db.commit()
+                return  # another start is in progress and this timer was not the one launched for it
             if data.get("pid") != me:
                 data.update(pid=me, birth=duet.process_birth(me))
                 save(db, data)
@@ -553,5 +558,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=["run"])
     parser.add_argument("--root", required=True)
+    parser.add_argument("--token")
     args = parser.parse_args()
-    runner(args.root)
+    runner(args.root, args.token)

@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 TERMINAL = {"completed", "failed", "cancelled", "timed_out", "interrupted"}
 FLAGS = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
@@ -58,6 +58,13 @@ def connect(root):
             except sqlite3.OperationalError:
                 if name not in {r[1] for r in db.execute("PRAGMA table_info(jobs)")}:
                     raise
+    if "footer" not in {r[1] for r in db.execute("PRAGMA table_info(messages)")}:
+        try:
+            db.execute("ALTER TABLE messages ADD COLUMN footer TEXT")  # the version line this bridge appended, if any
+            db.commit()
+        except sqlite3.OperationalError:
+            if "footer" not in {r[1] for r in db.execute("PRAGMA table_info(messages)")}:
+                raise
     if "seen" not in {r[1] for r in db.execute("PRAGMA table_info(messages)")}:
         try:
             # When the recipient's own conversation first read the message: an automatic delivery receipt.
@@ -560,13 +567,60 @@ NOT_FOR_THIS_ACCOUNT = re.compile(
     r"|(?:you(?:'ve| have)? (?:hit|reached|exceeded)|your|account|plan)[^\n]{0,60}?(?:usage limit|rate limit|quota)"
     r"|usage limit (?:reached|exceeded)|insufficient_quota|rate_limit_exceeded|too many requests|\b429\b", re.I)
 
+ACCOUNT_LIMIT = re.compile(
+    r"(?:you(?:'ve| have)?|your account has|account) (?:hit|reached|exceeded) (?:your|its|the) (?:\d+[- ]hour|daily|weekly|monthly|session|usage) limit"
+    r"|^\s*(?:\d+[- ]hour|daily|weekly|monthly|session) limit (?:reached|exceeded)", re.I | re.M)
+PAUSE_AFTER_LIMIT = 30 * 60
+
+MODEL_WORDS = re.compile(r"\b(?:opus|sonnet|haiku|fable|sol|astra|terra|luna|gpt-[\d.]+[a-z-]*|claude-[a-z0-9.-]+)\b", re.I)
+
+def model_limit(text):
+    """A cap on one model ("your Opus weekly limit"), which the next model down does not share."""
+    return bool(re.search(r"(?:hit|reached|exceeded) (?:your|the) [^\n]{0,40}?(?:\d+[- ]hour|daily|weekly|monthly|session|usage) limit", text or "", re.I)
+                and MODEL_WORDS.search(text or ""))
+
+def account_limit(text):
+    """The whole account is out of usage for a while (a session, daily or weekly limit). Every model of
+    that vendor is affected, so stepping down a model does not help; waiting or the other vendor does.
+    Returns the reset wording if the provider gave one, '' if it did not, None if this is not that case."""
+    text = text or ""
+    if not ACCOUNT_LIMIT.search(text) or model_limit(text):
+        return None
+    found = re.search(r"resets?\s+(?:at\s+|in\s+)?([^\n.;|]{1,60})", text, re.I)
+    return found[1].strip() if found else ""
+
+def mark_account_limited(provider, why, resets):
+    def mutate(state):
+        limits = state.get("account_limit") if isinstance(state.get("account_limit"), dict) else {}
+        limits[provider] = {"at": time.time(), "why": (why or "")[:300], "resets": resets or None}
+        state["account_limit"] = limits
+    try:
+        change_models_state(mutate)
+    except OSError:
+        pass
+
+def account_limited(provider):
+    """The recorded limit, while it is fresh enough to be worth respecting; else None."""
+    info = (models_state().get("account_limit") or {}).get(provider)
+    if isinstance(info, dict) and time.time() - float(info.get("at") or 0) < PAUSE_AFTER_LIMIT:
+        return info
+    return None
+
+def limit_message(provider, info):
+    name = "Claude" if provider == "claude" else "Codex"
+    other_side = "codex" if provider == "claude" else "claude"
+    when = (" It resets %s." % info["resets"]) if info.get("resets") else ""
+    return ("The %s account has reached its usage limit, so no %s model can run right now.%s "
+            "Ask the other vendor instead (provider=%s), or wait; this is checked again in %d minutes."
+            % (name, name, when, other_side, PAUSE_AFTER_LIMIT // 60))
+
 def not_for_this_account(text):
     """Does this failure mean "this account cannot use that model right now" (plan, access or quota)?
     A sign-in problem is something else and is handled by the sign-in path."""
     text = text or ""
     if re.search(r"authenticat|oauth|log ?in|sign ?in|api key", text, re.I):
         return False
-    return bool(NOT_FOR_THIS_ACCOUNT.search(text))
+    return bool(NOT_FOR_THIS_ACCOUNT.search(text)) or model_limit(text)
 
 def unavailable_families(provider):
     marks = (models_state().get("unavailable") or {}).get(provider)
@@ -1343,6 +1397,11 @@ def run_worker(root, job_id):
                         parsed = json.loads(raw)
                     except json.JSONDecodeError as exc:
                         result.update(error=f"Claude returned invalid JSON: {exc}", stdout_tail=raw[-6000:])
+                        resets = account_limit(error[-600:]) if proc.returncode else None
+                        if resets is not None:  # the limit was only said on stderr
+                            mark_account_limited("claude", error[-600:], resets)
+                            result["account_limit"] = {"resets": resets or None}
+                            result["hint"] = limit_message("claude", {"resets": resets})
                         job_update(db, job_id, "failed", result)
                         return
                     result.update(answer=parsed.get("result", ""), actual_models=list(parsed.get("modelUsage", {})),
@@ -1376,6 +1435,9 @@ def run_worker(root, job_id):
                         if event.get("type") in {"error", "turn.failed"}:
                             success = False
                             result["error"] = event
+                            # What the provider itself said, without any context it echoed back.
+                            said = event.get("message") or (event.get("error") or {}).get("message") if isinstance(event.get("error"), dict) else event.get("message")
+                            result["provider_error"] = str(said or "")[:1000]
                             if "auth" in encode(event).lower() or "login" in encode(event).lower():
                                 result["hint"] = "The Codex CLI may be signed out. " + LOGIN_FIX["codex"] + " Then retry this job."
                 if not result.get("answer"):
@@ -1386,6 +1448,20 @@ def run_worker(root, job_id):
                 # a task that merely talks about rate limits, or work that already ran, is never redone.
                 produced = bool(result.get("answer")) if job["provider"] == "codex" else bool(((result.get("usage") or {}).get("output_tokens") or 0))
                 refused = "" if (success or produced) else (encode(result["error"]) if isinstance(result.get("error"), (dict, list)) else str(result.get("error") or ""))
+                # The account-limit check reads only the provider's own words for a failed call, never task
+                # text or echoed context: a false positive would block a working vendor for half an hour.
+                own_words = "" if (success or produced) else (result.get("provider_error") if job["provider"] == "codex"
+                                                               else str(result.get("error") or ""))
+                if not (success or produced) and result.get("exit_code"):
+                    own_words = (own_words + "\n" + str(result.get("stderr_tail") or "")[-600:]).strip()
+                refused = refused if not model_limit(own_words) else (refused or own_words)
+                resets = account_limit(own_words) if own_words else None
+                if resets is not None:
+                    # The whole account is out for a while: another model of the same vendor would fail too.
+                    mark_account_limited(job["provider"], refused, resets)
+                    result["account_limit"] = {"resets": resets or None}
+                    result["hint"] = limit_message(job["provider"], {"resets": resets})
+                    break
                 step_down = next_route(job["provider"], routing, job["tier"], job["effort"], refused, check_cancel, started + job["timeout"]) \
                     if (refused and not_for_this_account(refused) and len(routing.get("tried") or []) < 2) else None
                 if not step_down:
@@ -1436,7 +1512,13 @@ def doctor():
         except Exception as exc:
             result["providers"][provider] = {"error": str(exc)}
             result["problems"].append(f"{provider}: {exc}")
-    working = [p for p, info in result["providers"].items() if "error" not in info and info.get("logged_in") is not False]
+    for provider in ("codex", "claude"):
+        limited = account_limited(provider)
+        if limited:
+            result["providers"].setdefault(provider, {})["account_limit"] = limited.get("resets") or "reached"
+            result["problems"].append(limit_message(provider, limited))
+    working = [p for p, info in result["providers"].items()
+               if "error" not in info and info.get("logged_in") is not False and not info.get("account_limit")]
     result["ready"] = {"mailbox_and_checkpoints": True,
                        "consult_codex": "codex" in working, "consult_claude": "claude" in working,
                        "native_pairing": len(working) == 2 and not any("older" in p or "queue" in p for p in result["problems"])}
@@ -1700,6 +1782,13 @@ def dispatch(operation, args):
             if models_check_due():
                 result["models_check_due"] = "Call duet_doctor fix=true (or duet_models refresh=true) before the first consultation."
         return result
+    if operation == "send" and args.get("kind") == "result" and args.get("git") is not False and "_footer" not in args:
+        # Asking git takes a moment; do it before the mailbox is locked.
+        try:
+            root_path = Path(args["root"]).expanduser().resolve(strict=True)
+            args = dict(args, _footer=git_context(root_path))
+        except OSError:
+            pass
     wake = False
     if operation == "send" and args.get("wake") is not None:
         wake = flag(args, "wake")
@@ -1733,6 +1822,8 @@ def operate(op, a, root, state, db):
     if op not in ("join", "status"):
         if not project or a.get("project_id") != project["id"]:
             raise ValueError("Project ID mismatch: join the intended project before sending or executing")
+    elif a.get("project_id") and project and a["project_id"] != project["id"]:
+        raise ValueError("Project ID mismatch: this root belongs to project %s" % project["id"])
     if op in ("inbox", "send", "status", "checkpoint") and a.get("peek") is not True:
         try:
             import schedule
@@ -1745,6 +1836,9 @@ def operate(op, a, root, state, db):
     if op == "join":
         if not a.get("project_name", "").strip() or not a.get("goal", "").strip():
             raise ValueError("A specific project_name and collaboration goal are required")
+        if not project and a.get("project_id"):
+            raise ValueError("This folder has no Agent Duet project yet, so project %s is somewhere else. Check the path; "
+                             "leave project_id out to start a new project here." % a["project_id"])
         if not project:
             db.execute("INSERT OR IGNORE INTO project VALUES(1,?,?,?,?)",
                        (uuid.uuid4().hex, canonical, a["project_name"], a["goal"]))
@@ -1856,24 +1950,29 @@ def operate(op, a, root, state, db):
         existing = db.execute("SELECT * FROM messages WHERE sender=? AND dedupe=?", (a["sender"], dedupe)).fetchone()
         if existing:
             # The stored text may carry the version footer this bridge appended; nothing else may differ.
-            stored = existing["body"]
-            same_text = stored == body or (existing["kind"] == "result" and GIT_FOOTER.sub("", stored, count=1) == body
-                                           and GIT_FOOTER.search(stored) is not None)
+            stored, footer = existing["body"], existing["footer"]
+            # footer is NULL only for messages written before 3.1, which did append a version line to results.
+            legacy = footer is None and existing["kind"] == "result" and GIT_FOOTER.search(stored) is not None
+            same_text = stored == body or bool(footer and stored == body + "\n\n" + footer) or (
+                legacy and GIT_FOOTER.sub("", stored, count=1) == body)
             if existing["recipient"] != a["recipient"] or not same_text:
                 raise ValueError("dedupe key reused for a different message")
             return {"message_id": existing["id"], "duplicate": True}
-        version = git_context(root) if kind == "result" and a.get("git") is not False else None
+        version = a.get("_footer") if kind == "result" and a.get("git") is not False else None
         if version and len(body) + len(version) + 2 <= 50000:
             body = body + "\n\n" + version  # the reviewer sees exactly which commit and files this is about
         reply = a.get("reply_to")
         if reply is not None:
             original = db.execute("SELECT * FROM messages WHERE id=?", (reply,)).fetchone()
             mine, theirs = set(own_names(db, a["sender"])), set(own_names(db, a["recipient"]))
-            if not original or not ((original["recipient"] in mine and original["sender"] in theirs) or
+            # A scheduled check-in comes from the bridge itself: the handoff it asks for goes to the peer,
+            # and answering it that way closes the check-in.
+            from_schedule = bool(original) and original["sender"] == "scheduler" and original["recipient"] in mine
+            if not original or not (from_schedule or (original["recipient"] in mine and original["sender"] in theirs) or
                                     (original["sender"] in mine and original["recipient"] in theirs)):
-                raise ValueError("reply_to must reference a message between the same participants")
-        cur = db.execute("INSERT INTO messages(sender,recipient,kind,body,reply_to,dedupe,created) VALUES(?,?,?,?,?,?,?)",
-                         (a["sender"], a["recipient"], kind, body, reply, dedupe, now))
+                raise ValueError("reply_to must reference a message between the same participants (or a check-in addressed to you)")
+        cur = db.execute("INSERT INTO messages(sender,recipient,kind,body,reply_to,dedupe,created,footer) VALUES(?,?,?,?,?,?,?,?)",
+                         (a["sender"], a["recipient"], kind, body, reply, dedupe, now, version if version and body.endswith(version) else ""))
         result = {"message_id": cur.lastrowid, "delivered_to": "durable mailbox", "gui_woken": False}
         if version:
             result["code_version"] = version
@@ -1937,6 +2036,10 @@ def operate(op, a, root, state, db):
             raise ValueError("mode must be work or review")
         if provider not in ("codex", "claude") or tier not in ("standard", "hard") or effort not in ("medium", "high", "xhigh", "max"):
             raise ValueError("Invalid provider, tier, or effort")
+        limited = account_limited(provider)
+        if limited:
+            # Do not spend a call that is certain to fail; say when it will work and what works now.
+            raise ValueError(limit_message(provider, limited))
         signed_out = login_problem(provider)
         if signed_out:
             helped = prompt_login(provider)
@@ -2054,7 +2157,9 @@ DEFS = {
     "cancel": ("Cancel only a bridge-owned CLI job; its worker terminates its process tree.", {"root": ROOT, "job_id": S}, ["root", "job_id"]),
 }
 for _name, _spec in DEFS.items():
-    if "root" in _spec[1] and _name not in ("join", "status"):
+    if _name in ("join", "status"):
+        _spec[1]["project_id"] = {"type": "string", "description": "Optional here; if given it must match this root's project."}
+    elif "root" in _spec[1]:
         _spec[1]["project_id"] = {"type": "string", "description": "Exact project.id returned by join; prevents cross-project actions."}
         _spec[2].append("project_id")
 
@@ -2077,9 +2182,15 @@ class BridgeUnavailable(Exception):
 def check_arguments(name, args):
     """One validation for every entry point: MCP, the CLI, and a hand-off after an upgrade."""
     if name not in DEFS:
-        raise ValueError("Unknown tool")
-    if not isinstance(args, dict) or set(args) - set(DEFS[name][1]) or set(DEFS[name][2]) - set(args):
-        raise ValueError("Unknown or missing arguments")
+        raise ValueError("Unknown tool duet_%s; duet_guide lists what is available" % name)
+    if not isinstance(args, dict):
+        raise ValueError("Arguments must be an object")
+    unknown, missing = sorted(set(args) - set(DEFS[name][1])), sorted(set(DEFS[name][2]) - set(args))
+    if unknown or missing:
+        # Say exactly what is wrong, so the caller can fix the call in one step.
+        parts = (["unknown: " + ", ".join(unknown)] if unknown else []) + (["missing: " + ", ".join(missing)] if missing else [])
+        raise ValueError("Unknown or missing arguments for duet_%s (%s). Accepted: %s"
+                         % (name, "; ".join(parts), ", ".join(sorted(DEFS[name][1]))))
 
 def run_installed(command, payload=None):
     """Run the bridge that is on disk now. An open conversation keeps its server process for hours or

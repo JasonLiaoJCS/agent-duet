@@ -38,7 +38,7 @@ class NativeTests(unittest.TestCase):
         m=self.send()
         with patch.object(native.subprocess,'run',side_effect=TimeoutError('uncertain')) as run:
             self.assertEqual(self.wake(m)['status'],'unknown'); self.wake(m)
-            self.assertEqual(run.call_count,1)
+            self.assertEqual(sum('--thread' in c.args[0] for c in run.call_args_list),1)  # the send itself is never repeated
     def test_stop_and_wrong_sender(self):
         m=self.send()
         with self.assertRaises(ValueError): self.wake(m,name='c')

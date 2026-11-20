@@ -92,7 +92,7 @@ def reachability(d, root, db):
 
 def compact_result(result):
     keys=('status','exit_code','processed_by_recipient','resume_requested','reported_cost_usd',
-          'models','sent','budget_note')
+          'models','sent','budget_note','account_limit')
     out={k:result[k] for k in keys if k in result}
     for k in ('response','stdout','stderr','error'):
         if result.get(k): out[k]=str(result[k])[:1000]
@@ -190,7 +190,7 @@ def relay_claude(d, root, address, title, text, budget=0.10, session=None):
         for block in e.get('message',{}).get('content',[]) if isinstance(e.get('message',{}).get('content'),list) else []:
             if block.get('type')=='tool_use' and block.get('name')=='SendMessage': sends.append(block)
             if block.get('type')=='tool_result': results[block.get('tool_use_id')]=block
-    return {'status':'attempted' if sends else 'not_sent', 'exit_code':r.returncode,
+    return {'status':'attempted' if sends else 'not_sent', 'exit_code':r.returncode, 'is_error':bool(final.get('is_error')),
             'send_calls':sends,'tool_results':[results.get(s['id']) for s in sends],
             'response':final.get('result',''), 'models':list(final.get('modelUsage',{})),
             'reported_cost_usd':final.get('total_cost_usd'), 'usage':final.get('usage'),
@@ -271,7 +271,9 @@ def operate(d, op, a, root, state, db, project):
         cap=int(a.get('max_wakes',40)); hours=float(a.get('max_hours',8)); budget=float(a.get('courier_budget_usd',2.0))
         check_limits(cap,hours,budget)
         run=create_run(db,names,now,cap,hours,budget)
-        return {'run_id':run,'state':'active','max_wakes':cap,'max_hours':hours,
+        db.commit()
+        import schedule
+        return {'run_id':run,'state':'active','max_wakes':cap,'max_hours':hours,'schedule_resumed':schedule.resume(root,db,now),
                 'courier_budget_usd':budget,'verified':False,
                 'limits':'max_wakes and the courier budget apply per rolling max_hours window; the pairing itself does not expire.',
                 'budget_scope':'Courier reported API-price estimates only; original chat model usage is not capped by this helper.'}
@@ -307,6 +309,12 @@ def operate(d, op, a, root, state, db, project):
         raise ValueError('That run ID is not the current pairing; omit run_id to use the current one')
     if msg['ack']: return {'status':'already_acknowledged'}
     previous=db.execute('SELECT * FROM native_attempts WHERE message_id=? ORDER BY updated DESC LIMIT 1',(msg['id'],)).fetchone()
+    carried=0.0
+    if previous and previous['state']=='not_sent' and previous['run_id']==(run['id'] if run else None):
+        # Nothing reached the conversation: retrying is safe. Keep its cost in the window's accounting.
+        item=json.loads(previous['result'])
+        carried=float(item.get('accounted_cost_usd') or item.get('reported_cost_usd') or 0)+float(item.get('carried_cost_usd') or 0)
+        previous=None  # its row stays until the new try replaces it, so its cost still counts in the window
     if previous: return {'status':previous['state'],'duplicate':True,'result':compact_result(json.loads(previous['result']))}
     names=[msg['sender'],msg['recipient']]
     if system:
@@ -353,7 +361,8 @@ def operate(d, op, a, root, state, db, project):
                 'retry_after_seconds':max(1,round(oldest+run['window']-now)),
                 'note':'Wake rate limit for this window. The message is safe in the mailbox and the pairing stays active; '
                        'the peer reads it at its next work boundary. Raise the limit with native_start(max_wakes=...) only if the task needs it.'}
-    recent=db.execute('SELECT MAX(a.updated) FROM native_attempts a JOIN messages m ON m.id=a.message_id WHERE a.run_id=? AND m.recipient=?',(run['id'],msg['recipient'])).fetchone()[0]
+    # The burst interval is about other messages to the same side; retrying this one after it was not sent is not a burst.
+    recent=db.execute('SELECT MAX(a.updated) FROM native_attempts a JOIN messages m ON m.id=a.message_id WHERE a.run_id=? AND m.recipient=? AND a.message_id<>?',(run['id'],msg['recipient'],msg['id'])).fetchone()[0]
     if recent and now-recent<20:
         db.commit()
         return {'status':'cooldown','retry_after_seconds':round(20-(now-recent),1),'sent':False,
@@ -364,7 +373,7 @@ def operate(d, op, a, root, state, db, project):
         used=0.0
         for row in db.execute("SELECT result FROM native_attempts WHERE run_id=? AND (updated>=? OR state='sending')",(run['id'],since)):
             item=json.loads(row[0])
-            used+=float(item.get('accounted_cost_usd') or item.get('reported_cost_usd') or 0)
+            used+=float(item.get('accounted_cost_usd') or item.get('reported_cost_usd') or 0)+float(item.get('carried_cost_usd') or 0)
         remaining=run['courier_budget']-used
         if remaining<0.01:
             db.commit()
@@ -378,6 +387,12 @@ def operate(d, op, a, root, state, db, project):
         db.commit()
         return {'status':'not_sent','sent':False,'error':str(exc),'processed_by_recipient':False,
                 'fix':'Install and log in to the %s CLI on this machine (duet_doctor shows what is missing); the message is safe in the mailbox.' % binding['provider']}
+    limited=d.account_limited('claude') if binding['provider']=='claude' else None
+    if limited:
+        # The Claude courier would only hit the same account limit; nothing is spent and the wake can be repeated.
+        db.commit()
+        return {'status':'not_sent','sent':False,'processed_by_recipient':False,'error':d.limit_message('claude',limited),
+                'fix':'The message is safe in the mailbox; the Claude conversation reads it when it is next active, or repeat this wake after the reset.'}
     signed_out=d.login_problem(binding['provider'])
     if signed_out:
         db.commit()
@@ -385,15 +400,40 @@ def operate(d, op, a, root, state, db, project):
         return {'status':'not_sent','sent':False,'error':signed_out,'needs_user':True,'processed_by_recipient':False,
                 'user_was_prompted':helped.get('prompted',False),
                 'fix':(helped.get('tell_the_user') or 'Tell the user this one step.')+' The message is safe in the mailbox and this wake can be repeated afterwards.'}
-    db.execute('INSERT INTO native_attempts VALUES(?,?,?,?,?)',(run['id'],msg['id'],'sending',now,json.dumps(reservation)))
+    resume=[]  # probed before the reservation, so the last state check sits right before the send
+    if binding['provider']=='codex':
+        db.commit()  # never hold the mailbox while a CLI starts up
+        try:
+            help_result=subprocess.run(transport+['queue','--help'],capture_output=True,text=True,
+                                       encoding='utf-8',timeout=10,creationflags=d.FLAGS)
+            resume=['--resume'] if '--resume' in (help_result.stdout or '') else []
+        except Exception:
+            resume=[]  # an unreadable help text only means the optional --resume is not used
+        db.commit(); db.execute('BEGIN IMMEDIATE')   # the probe took time: decide on a fresh view
+        run=db.execute('SELECT * FROM native_run').fetchone()
+        if not run or run['state']!='active':
+            db.commit()
+            return {'status':'not_sent','sent':False,'processed_by_recipient':False,'error':'the collaboration was paused or finished before this wake went out'}
+    if carried:
+        reservation['carried_cost_usd']=carried
+    db.execute('INSERT OR REPLACE INTO native_attempts VALUES(?,?,?,?,?)',(run['id'],msg['id'],'sending',now,json.dumps(reservation)))
     db.commit()  # Claim before external effect; a crash is ambiguous, never automatically resend.
+    # Last look before anything leaves the machine: a finish or pause that landed after the reservation wins.
+    fresh=db.execute('SELECT id,state FROM native_run').fetchone()
+    halted=not fresh or fresh['state']!='active' or fresh['id']!=run['id']
+    if system and not halted:
+        import schedule
+        plan=schedule.load(db)
+        halted=not plan or plan.get('state')!='active' or (a.get('_schedule_id') and plan.get('id')!=a['_schedule_id'])
+    if halted:
+        db.execute("UPDATE native_attempts SET state='not_sent',updated=?,result=? WHERE run_id=? AND message_id=?",
+                   (time.time(),json.dumps(dict(reservation,status='not_sent',error='stopped before sending')),run['id'],msg['id']))
+        db.commit()
+        return {'status':'not_sent','sent':False,'processed_by_recipient':False,'error':'the collaboration was paused or finished before this wake went out'}
     text=notice(project,root,msg)
     try:
         if binding['provider']=='codex':
             command=transport
-            help_result=subprocess.run(command+['queue','--help'],capture_output=True,text=True,
-                                       encoding='utf-8',timeout=10,creationflags=d.FLAGS)
-            resume=['--resume'] if '--resume' in help_result.stdout else []
             r=subprocess.run(command+['queue']+resume+['--thread',binding['session'],'--message',text],
                              cwd=root,capture_output=True,text=True,encoding='utf-8',timeout=30,creationflags=d.FLAGS)
             result={'status':'queued' if r.returncode==0 else 'failed','stdout':r.stdout[-3000:],
@@ -401,6 +441,12 @@ def operate(d, op, a, root, state, db, project):
         else:
             result=relay_claude(d,root,binding['address'],binding['title'],text,
                                 reservation['accounted_cost_usd'],session=binding['session'])
+            said=' '.join([str(result.get('response') or '') if result.get('is_error') else '',
+                           str(result.get('error') or '') if result.get('exit_code') else ''])
+            resets=d.account_limit(said) if said else None
+            if resets is not None:
+                d.mark_account_limited('claude',said,resets)
+                result['account_limit']={'resets':resets or None}
             if result.get('reported_cost_usd') is None:
                 result.update(reservation)
                 result['budget_note']='Usage unavailable; reserve the invocation threshold in the courier budget. This is not measured cost.'
@@ -408,6 +454,8 @@ def operate(d, op, a, root, state, db, project):
         result={'status':'unknown','error':str(exc),'processed_by_recipient':False}
         if binding['provider']=='claude':
             result.update(reservation)
+    if carried:
+        result.setdefault('carried_cost_usd',carried)  # an earlier try of this message that did not get through
     db.execute('UPDATE native_attempts SET state=?,updated=?,result=? WHERE run_id=? AND message_id=?',
                (result['status'],time.time(),json.dumps(result,ensure_ascii=False),run['id'],msg['id']))
     return compact_result(result)
